@@ -77,9 +77,9 @@ Resources:
   CompressFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/
-      Handler: app.lambda_handler
-      Runtime: python3.13
+      CodeUri: rust-compressor/
+      Handler: bootstrap
+      Runtime: provided.al2023
       Architectures:
         - arm64
       MemorySize: 10240
@@ -90,7 +90,7 @@ Resources:
           DEFAULT_TARGET_BUCKET: !Ref TargetBucket
           DEFAULT_SOURCE_PREFIX: "logs/"
           DEFAULT_TARGET_PREFIX: "compressed/"
-          MAX_WORKERS: "64"
+          MAX_WORKERS: "512"
       VpcConfig:
         SecurityGroupIds:
           - !Ref LambdaSecurityGroup
@@ -102,32 +102,10 @@ Resources:
             BucketName: !Ref SourceBucket
         - S3WritePolicy:
             BucketName: !Ref TargetBucket
-      Layers:
-        - arn:aws:lambda:eu-central-1:534406734576:layer:zip-zstd-al2023-arm64:1
-
-  BenchmarkFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: src/
-      Handler: benchmark.lambda_handler
-      Runtime: python3.13
-      Architectures:
-        - arm64
-      MemorySize: 10240
-      Timeout: 900
-      Environment:
-        Variables:
-          DEFAULT_SOURCE_BUCKET: !Ref SourceBucket
-          DEFAULT_SOURCE_PREFIX: "logs/"
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref LambdaSecurityGroup
-        SubnetIds:
-          - !Ref SubnetA
-          - !Ref SubnetB
-      Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref SourceBucket
+      # Layers:
+      #   - arn:aws:lambda:eu-central-1:534406734576:layer:zip-zstd-al2023-arm64:1
+    Metadata:
+      BuildMethod: rust-cargolambda
 
   RustBenchmarkFunction:
     Type: AWS::Serverless::Function

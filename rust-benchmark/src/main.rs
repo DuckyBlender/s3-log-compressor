@@ -5,6 +5,7 @@ use lambda_runtime::{service_fn, Error, LambdaEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
+use std::fs;
 use std::time::{Instant};
 use tokio::io::AsyncWriteExt;
 
@@ -12,7 +13,6 @@ use tokio::io::AsyncWriteExt;
 struct Request {
     source_bucket: Option<String>,
     source_prefix: Option<String>,
-    max_files: Option<usize>,
 }
 
 #[derive(Serialize, Debug)]
@@ -57,14 +57,17 @@ async fn list_keys(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<(S
     Ok(keys)
 }
 
-async fn download_file(client: &Client, bucket: &str, key: &str) -> Result<u64, Error> {
+async fn download_file(client: &Client, bucket: &str, key: &str, local_path: &std::path::Path) -> Result<u64, Error> {
+    if let Some(parent) = local_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::File::create(local_path).await?;
     let mut object = client.get_object().bucket(bucket).key(key).send().await?;
-    let mut sink = tokio::io::sink();
     let mut bytes_downloaded = 0;
     while let Some(bytes) = object.body.next().await {
         let bytes = bytes?;
         bytes_downloaded += bytes.len() as u64;
-        sink.write_all(&bytes).await?;
+        file.write_all(&bytes).await?;
     }
     Ok(bytes_downloaded)
 }
@@ -72,6 +75,7 @@ async fn download_file(client: &Client, bucket: &str, key: &str) -> Result<u64, 
 async fn benchmark_downloads(
     client: &Client,
     source_bucket: &str,
+    source_prefix: &str,
     keys: &[(String, i64)],
     max_workers: usize,
 ) -> Result<BenchmarkResult, Error> {
@@ -82,8 +86,11 @@ async fn benchmark_downloads(
             let client = client.clone();
             let source_bucket = source_bucket.to_string();
             let key = key.clone();
+            let source_prefix = source_prefix.to_string();
             tokio::spawn(async move {
-                download_file(&client, &source_bucket, &key).await
+                let rel_path = key.strip_prefix(&source_prefix).unwrap_or(&key);
+                let local_path = std::path::Path::new("/tmp").join(rel_path);
+                download_file(&client, &source_bucket, &key, &local_path).await
             })
         })
         .buffer_unordered(max_workers);
@@ -92,7 +99,7 @@ async fn benchmark_downloads(
         .map(|res| match res {
             Ok(Ok(size)) => Ok(size),
             Ok(Err(e)) => Err(e),
-            Err(e) => Ok(Err(Box::new(e))?),
+            Err(e) => Err(Box::new(e) as Error),
         })
         .collect()
         .await;
@@ -130,13 +137,11 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
 
     let source_bucket = request.source_bucket.or_else(|| env::var("DEFAULT_SOURCE_BUCKET").ok()).unwrap();
     let source_prefix = request.source_prefix.or_else(|| env::var("DEFAULT_SOURCE_PREFIX").ok()).unwrap_or_else(|| "logs/".to_string());
-    let max_files = request.max_files.unwrap_or(1000);
-
+    
     tracing::info!(
-        "BENCHMARK_START,bucket={},prefix={},max_files={}",
+        "BENCHMARK_START,bucket={},prefix={}",
         source_bucket,
         source_prefix,
-        max_files
     );
 
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
@@ -144,8 +149,7 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
 
     tracing::info!("PHASE,listing_files");
     let start_list = Instant::now();
-    let mut key_size_pairs = list_keys(&client, &source_bucket, &source_prefix).await?;
-    key_size_pairs.truncate(max_files);
+    let key_size_pairs = list_keys(&client, &source_bucket, &source_prefix).await?;
     let end_list = Instant::now();
 
     let total_bytes: i64 = key_size_pairs.iter().map(|(_, size)| size).sum();
@@ -156,7 +160,7 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
         end_list.duration_since(start_list).as_secs_f64()
     );
 
-    let worker_counts = vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+    let worker_counts = vec![64, 128, 256, 512, 1024, 2048];
     let mut results = Vec::new();
 
     for &workers in &worker_counts {
@@ -165,8 +169,23 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
             continue;
         }
 
+        // Clear /tmp directory before each run
+        let tmp_dir = std::path::Path::new("/tmp");
+        if tmp_dir.exists() {
+            for entry in fs::read_dir(tmp_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    fs::remove_dir_all(path)?;
+                } else {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+
+
         tracing::info!("PHASE,downloading,workers={}", workers);
-        match benchmark_downloads(&client, &source_bucket, &key_size_pairs, workers).await {
+        match benchmark_downloads(&client, &source_bucket, &source_prefix, &key_size_pairs, workers).await {
             Ok(result) => {
                 tracing::info!(
                     "RESULT,{},{:.3},{:.2},{},{}",
@@ -182,6 +201,11 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
                 tracing::error!("ERROR,workers={},error={:?}", workers, e);
             }
         }
+
+        // Count files in /tmp after each run
+        let paths = fs::read_dir("/tmp").unwrap();
+        let file_count = paths.count();
+        tracing::info!("Files in /tmp after run: {}", file_count);
     }
 
     let best_result = results.iter().min_by(|a, b| a.duration.partial_cmp(&b.duration).unwrap());

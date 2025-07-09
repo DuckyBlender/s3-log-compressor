@@ -1,5 +1,5 @@
 [package]
-name = "rust-benchmark"
+name = "rust-compressor"
 version = "0.1.0"
 edition = "2021"
 
@@ -14,5 +14,9 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 bytes = "1.10"
-tokio-stream = "0.1"
-async-stream = "0.3"
+tokio-stream = "0.1.17"
+async-stream = "0.3.6"
+zip = "4.2"
+zstd = "0.13"
+walkdir = "2.5"
+tempfile = "3.20"
