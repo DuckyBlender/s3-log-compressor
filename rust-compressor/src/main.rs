@@ -9,7 +9,7 @@ use std::io::{Read, Write, Cursor};
 use std::path::Path;
 use std::time::Instant;
 use tempfile::tempdir;
-use tracing::{info, Level};
+use tracing::{info, error, Level};
 use walkdir::WalkDir;
 use zip::read::ZipArchive;
 use zip::write::{FileOptions, ZipWriter};
@@ -51,12 +51,9 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
     match result {
         Ok(value) => Ok(value),
         Err(e) => {
-            let error_message = format!("{}", e);
-            info!(error_message, "Operation failed");
-            Ok(serde_json::json!({
-                "status": "error",
-                "message": error_message
-            }))
+            let error_message = format!("{:#?}", e);
+            error!("Operation failed: {}", error_message);
+            Ok(serde_json::json!({ "status": "error", "message": error_message }))
         }
     }
 }
@@ -69,6 +66,7 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let source_prefix = event["source_prefix"].as_str().or(env::var("DEFAULT_SOURCE_PREFIX").ok().as_deref()).unwrap_or("logs/").to_string();
     let target_prefix = event["target_prefix"].as_str().or(env::var("DEFAULT_TARGET_PREFIX").ok().as_deref()).unwrap_or("compressed/").to_string();
     let max_workers: usize = env::var("MAX_WORKERS").unwrap_or_else(|_| "512".to_string()).parse()?;
+    let kms_key_id = env::var("KMS_KEY_ID").ok();
 
     info!(source_bucket, target_bucket, source_prefix, target_prefix, "Configuration");
 
@@ -130,7 +128,15 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let start_upload = Instant::now();
     let final_key = format!("{}archive.zip.zst", target_prefix);
     let stream = ByteStream::from_path(&archive_zst_path).await?;
-    client.put_object().bucket(&target_bucket).key(&final_key).body(stream).send().await?;
+    
+    let mut put_object_request = client.put_object().bucket(&target_bucket).key(&final_key).body(stream);
+    if let Some(key_id) = kms_key_id {
+        put_object_request = put_object_request
+            .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .ssekms_key_id(key_id);
+    }
+    
+    put_object_request.send().await?;
     info!("Uploaded to S3 in {:.2?}", start_upload.elapsed());
 
     Ok(serde_json::json!({ "status": "ok", "output_key": final_key }))

@@ -4,6 +4,7 @@ version = 0.1
 
 [default.global.parameters]
 stack_name = "s3-log-compressor"
+beta_features = true
 
 [default.build.parameters]
 cached = true
@@ -14,7 +15,7 @@ lint = true
 
 [default.deploy.parameters]
 capabilities = "CAPABILITY_IAM"
-confirm_changeset = true
+confirm_changeset = false
 resolve_s3 = true
 s3_prefix = "s3-log-compressor"
 region = "eu-central-1"

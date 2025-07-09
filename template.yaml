@@ -3,6 +3,36 @@ Transform: AWS::Serverless-2016-10-31
 
 Resources:
 
+  # KMS Key
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "KMS key for S3 server-side encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'Allow administration of the key'
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: 'Allow S3 to use the key'
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - 'kms:GenerateDataKey*'
+              - 'kms:Decrypt'
+            Resource: '*'
+
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/s3-log-compressor-key
+      TargetKeyId: !Ref KmsKey
+
   # S3 Buckets
   SourceBucket:
     Type: AWS::S3::Bucket
@@ -91,6 +121,7 @@ Resources:
           DEFAULT_SOURCE_PREFIX: "logs/"
           DEFAULT_TARGET_PREFIX: "compressed/"
           MAX_WORKERS: "512"
+          KMS_KEY_ID: !Ref KmsKey
       VpcConfig:
         SecurityGroupIds:
           - !Ref LambdaSecurityGroup
@@ -104,6 +135,13 @@ Resources:
             BucketName: !Ref TargetBucket
         - S3ReadPolicy:
             BucketName: !Ref TargetBucket
+        - KMSDecryptPolicy:
+            KeyId: !Ref KmsKey
+        - Statement:
+          - Effect: Allow
+            Action:
+              - "kms:GenerateDataKey"
+            Resource: !GetAtt KmsKey.Arn
       # Layers:
       #   - arn:aws:lambda:eu-central-1:534406734576:layer:zip-zstd-al2023-arm64:1
     Metadata:
