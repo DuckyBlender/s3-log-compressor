@@ -76,7 +76,7 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     fs::create_dir_all(&log_dir)?;
 
     // Step 1: List all files to compress
-    let (keys, total_original_size) = list_keys(&client, &source_bucket, &source_prefix).await?;
+    let (keys, total_original_size) = list_keys(client, &source_bucket, &source_prefix).await?;
     info!(
         "Listed {} keys with a total size of {} bytes",
         keys.len(),
@@ -85,7 +85,7 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
 
     // Step 2: Download all files concurrently
     let start_dl = Instant::now();
-    download_files(&client, &source_bucket, &keys, &log_dir, &source_prefix, max_workers).await?;
+    download_files(client, &source_bucket, &keys, &log_dir, &source_prefix, max_workers).await?;
     info!("Downloaded all files in {:.2?}", start_dl.elapsed());
 
     // Recalculate total size from downloaded files

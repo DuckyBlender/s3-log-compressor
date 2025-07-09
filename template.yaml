@@ -112,6 +112,8 @@ Resources:
       Runtime: provided.al2023
       Architectures:
         - arm64
+      EphemeralStorage:
+        Size: 2048
       MemorySize: 10240
       Timeout: 900
       Environment:
@@ -155,6 +157,8 @@ Resources:
       Runtime: provided.al2023
       Architectures:
         - arm64
+      EphemeralStorage:
+        Size: 2048
       MemorySize: 10240
       Timeout: 900
       Environment:
