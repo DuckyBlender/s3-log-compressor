@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+
+  # S3 Buckets
+  SourceBucket:
+    Type: AWS::S3::Bucket
+
+  TargetBucket:
+    Type: AWS::S3::Bucket
+
+  # VPC
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyLambdaVPC
+
+  # Subnets
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+
+  # Route Table
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTable
+
+  # S3 Gateway Endpoint (only thing needed for S3 access)
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MyVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref RouteTable
+
+  # Security Group
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Lambda access
+      VpcId: !Ref MyVPC
+
+  # Lambda Function
+  CompressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Architectures:
+        - arm64
+      MemorySize: 10240
+      Timeout: 900
+      Environment:
+        Variables:
+          DEFAULT_SOURCE_BUCKET: !Ref SourceBucket
+          DEFAULT_TARGET_BUCKET: !Ref TargetBucket
+          DEFAULT_SOURCE_PREFIX: "logs/"
+          DEFAULT_TARGET_PREFIX: "compressed/"
+          MAX_WORKERS: "64"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetA
+          - !Ref SubnetB
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - S3WritePolicy:
+            BucketName: !Ref TargetBucket
+      Layers:
+        - arn:aws:lambda:eu-central-1:534406734576:layer:zip-zstd-al2023-arm64:1
+
+  BenchmarkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: benchmark.lambda_handler
+      Runtime: python3.13
+      Architectures:
+        - arm64
+      MemorySize: 10240
+      Timeout: 900
+      Environment:
+        Variables:
+          DEFAULT_SOURCE_BUCKET: !Ref SourceBucket
+          DEFAULT_SOURCE_PREFIX: "logs/"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetA
+          - !Ref SubnetB
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+
+  RustBenchmarkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: rust-benchmark/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      MemorySize: 10240
+      Timeout: 900
+      Environment:
+        Variables:
+          DEFAULT_SOURCE_BUCKET: !Ref SourceBucket
+          DEFAULT_SOURCE_PREFIX: "logs/"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetA
+          - !Ref SubnetB
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+    Metadata:
+      BuildMethod: rust-cargolambda
