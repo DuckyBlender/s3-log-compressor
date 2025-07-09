@@ -8,7 +8,7 @@ from tqdm import tqdm
 S3_BUCKET = "s3-log-compressor-sourcebucket-rkeoqdxsxu2w"
 S3_TARGET_FOLDER = "mock-logs/"  # Target folder in S3
 LOCAL_LOGS_DIR = "mock_logs"
-MAX_WORKERS = 10
+MAX_WORKERS = 100
 
 def upload_file_to_s3(s3_client, local_file_path, bucket, s3_key):
     """Upload a single file to S3"""

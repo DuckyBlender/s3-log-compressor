@@ -102,6 +102,8 @@ Resources:
             BucketName: !Ref SourceBucket
         - S3WritePolicy:
             BucketName: !Ref TargetBucket
+        - S3ReadPolicy:
+            BucketName: !Ref TargetBucket
       # Layers:
       #   - arn:aws:lambda:eu-central-1:534406734576:layer:zip-zstd-al2023-arm64:1
     Metadata:

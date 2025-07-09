@@ -5,17 +5,20 @@ use lambda_runtime::{service_fn, Error, LambdaEvent};
 use serde_json::Value;
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Write, Cursor};
 use std::path::Path;
 use std::time::Instant;
 use tempfile::tempdir;
-use walkdir::WalkDir;
 use tracing::{info, Level};
+use walkdir::WalkDir;
+use zip::read::ZipArchive;
 use zip::write::{FileOptions, ZipWriter};
-use zstd::stream::encode_all;
+use zstd::stream::{decode_all, encode_all};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // Initialize structured logging for CloudWatch
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .with_target(false)
@@ -27,25 +30,54 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+// Main Lambda handler - routes to compression or decompression based on event payload
 async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
     let (event, _context) = event.into_parts();
-
-    let source_bucket = event["source_bucket"].as_str().or(env::var("DEFAULT_SOURCE_BUCKET").ok().as_deref()).unwrap_or_default().to_string();
-    let target_bucket = event["target_bucket"].as_str().or(env::var("DEFAULT_TARGET_BUCKET").ok().as_deref()).unwrap_or_default().to_string();
-    let source_prefix = event["source_prefix"].as_str().or(env::var("DEFAULT_SOURCE_PREFIX").ok().as_deref()).unwrap_or("logs/").to_string();
-    let target_prefix = event["target_prefix"].as_str().or(env::var("DEFAULT_TARGET_PREFIX").ok().as_deref()).unwrap_or("compressed/").to_string();
-    let max_workers: usize = env::var("MAX_WORKERS").unwrap_or_else(|_| "1024".to_string()).parse()?;
-
-    info!(source_bucket, target_bucket, source_prefix, target_prefix, "Configuration");
+    let operation = event["operation"].as_str().unwrap_or("compress");
 
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let client = Client::new(&config);
 
+    // Route to appropriate handler based on operation type
+    let result = if operation == "compress" {
+        handle_compression(&client, &event).await
+    } else if operation == "decompress" {
+        handle_decompression(&client, &event).await
+    } else {
+        Ok(serde_json::json!({ "status": "error", "message": "Invalid operation" }))
+    };
+
+    // Convert any errors to JSON responses for easier debugging
+    match result {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            let error_message = format!("{}", e);
+            info!(error_message, "Operation failed");
+            Ok(serde_json::json!({
+                "status": "error",
+                "message": error_message
+            }))
+        }
+    }
+}
+
+// Compress multiple files from S3 into a single zstd-compressed archive
+async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Error> {
+    // Extract configuration from event or environment variables
+    let source_bucket = event["source_bucket"].as_str().or(env::var("DEFAULT_SOURCE_BUCKET").ok().as_deref()).unwrap_or_default().to_string();
+    let target_bucket = event["target_bucket"].as_str().or(env::var("DEFAULT_TARGET_BUCKET").ok().as_deref()).unwrap_or_default().to_string();
+    let source_prefix = event["source_prefix"].as_str().or(env::var("DEFAULT_SOURCE_PREFIX").ok().as_deref()).unwrap_or("logs/").to_string();
+    let target_prefix = event["target_prefix"].as_str().or(env::var("DEFAULT_TARGET_PREFIX").ok().as_deref()).unwrap_or("compressed/").to_string();
+    let max_workers: usize = env::var("MAX_WORKERS").unwrap_or_else(|_| "512".to_string()).parse()?;
+
+    info!(source_bucket, target_bucket, source_prefix, target_prefix, "Configuration");
+
+    // Create temporary directory for processing
     let tmp_dir = tempdir()?;
     let log_dir = tmp_dir.path().join("logs");
     fs::create_dir_all(&log_dir)?;
 
-    // List files
+    // Step 1: List all files to compress
     let (keys, total_original_size) = list_keys(&client, &source_bucket, &source_prefix).await?;
     info!(
         "Listed {} keys with a total size of {} bytes",
@@ -53,11 +85,12 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
         total_original_size
     );
 
-    // Download files
+    // Step 2: Download all files concurrently
     let start_dl = Instant::now();
     download_files(&client, &source_bucket, &keys, &log_dir, &source_prefix, max_workers).await?;
     info!("Downloaded all files in {:.2?}", start_dl.elapsed());
 
+    // Recalculate total size from downloaded files
     let total_original_size = WalkDir::new(&log_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -67,13 +100,13 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
         .sum::<u64>();
     info!(total_original_size_bytes = total_original_size, "Calculated total size of original files");
 
-    // Create zip
+    // Step 3: Create uncompressed zip archive
     let start_zip = Instant::now();
     let archive_zip_path = tmp_dir.path().join("archive.zip");
     zip_directory(&log_dir, &archive_zip_path, zip::CompressionMethod::Stored)?;
     info!("Created .zip archive in {:.2?}", start_zip.elapsed());
 
-    // Compress with zstd
+    // Step 4: Compress zip file with zstd
     let start_zst = Instant::now();
     let archive_zst_path = tmp_dir.path().join("archive.zip.zst");
     let mut zip_file = File::open(&archive_zip_path)?;
@@ -84,6 +117,7 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
     zst_file.write_all(&compressed_data)?;
     info!("Compressed with zstd in {:.2?}", start_zst.elapsed());
 
+    // Calculate compression metrics
     let compressed_size = fs::metadata(&archive_zst_path)?.len();
     info!(compressed_size_bytes = compressed_size, "Calculated final compressed size");
 
@@ -92,7 +126,7 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
         info!(compression_ratio = format!("{:.4}", ratio), "Calculated compression ratio (compressed/original)");
     }
 
-    // Upload to S3
+    // Step 5: Upload compressed archive to S3
     let start_upload = Instant::now();
     let final_key = format!("{}archive.zip.zst", target_prefix);
     let stream = ByteStream::from_path(&archive_zst_path).await?;
@@ -102,6 +136,47 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
     Ok(serde_json::json!({ "status": "ok", "output_key": final_key }))
 }
 
+// Decompress archive and extract a specific file, returning it as base64
+async fn handle_decompression(client: &Client, event: &Value) -> Result<Value, Error> {
+    let source_bucket = event["source_bucket"].as_str().ok_or("source_bucket not specified")?.to_string();
+    let source_key = event["source_key"].as_str().ok_or("source_key not specified")?.to_string();
+    let file_to_extract = event["file_to_extract"].as_str().ok_or("file_to_extract not specified")?.to_string();
+
+    info!(source_bucket, source_key, file_to_extract, "Decompression Configuration");
+
+    // Step 1: Download compressed archive from S3
+    let start_dl = Instant::now();
+    let mut object = client.get_object().bucket(&source_bucket).key(&source_key).send().await?;
+    let mut zst_data = Vec::new();
+    while let Some(bytes) = object.body.next().await {
+        zst_data.extend_from_slice(&bytes?);
+    }
+    info!("Downloaded {} bytes in {:.2?}", zst_data.len(), start_dl.elapsed());
+
+    // Step 2: Decompress zstd data back to zip
+    let start_decompress = Instant::now();
+    let zip_data = decode_all(&zst_data[..])?;
+    info!("Decompressed to {} bytes in {:.2?}", zip_data.len(), start_decompress.elapsed());
+
+    // Step 3: Extract specific file from zip archive
+    let start_unzip = Instant::now();
+    let mut archive = ZipArchive::new(Cursor::new(zip_data))?;
+    let mut file = archive.by_name(&file_to_extract)?;
+    let mut file_content = Vec::new();
+    file.read_to_end(&mut file_content)?;
+    info!("Extracted '{}' ({} bytes) in {:.2?}", file_to_extract, file_content.len(), start_unzip.elapsed());
+
+    // Step 4: Encode file content as base64 for JSON response
+    let encoded_content = STANDARD.encode(&file_content);
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "file_name": file_to_extract,
+        "file_content_base64": encoded_content
+    }))
+}
+
+// List all S3 objects under a given prefix and return keys with total size
 async fn list_keys(
     client: &Client,
     bucket: &str,
@@ -124,6 +199,7 @@ async fn list_keys(
     Ok((keys, total_size))
 }
 
+// Download multiple S3 objects concurrently to local directory
 async fn download_files(client: &Client, bucket: &str, keys: &[String], local_dir: &Path, prefix: &str, max_workers: usize) -> Result<(), Error> {
     stream::iter(keys)
         .map(|key| {
@@ -152,6 +228,7 @@ async fn download_files(client: &Client, bucket: &str, keys: &[String], local_di
     Ok(())
 }
 
+// Create a zip archive from a directory with specified compression method
 fn zip_directory(src_dir: &Path, dst_file: &Path, method: zip::CompressionMethod) -> zip::result::ZipResult<()> {
     let file = File::create(dst_file)?;
     let mut zip = ZipWriter::new(file);

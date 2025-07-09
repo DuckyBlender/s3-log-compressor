@@ -1,0 +1,6 @@
+{
+  "operation": "decompress",
+  "source_bucket": "s3-log-compressor-targetbucket-rigrlmvweehm",
+  "source_key": "mock-logs/archive.zip.zst",
+  "file_to_extract": "log_0001.json"
+}
