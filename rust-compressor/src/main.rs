@@ -60,35 +60,32 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
 
 // Compress multiple files from S3 into a single zstd-compressed archive
 async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Error> {
-    // Extract configuration from event or environment variables
-    let source_bucket = event["source_bucket"]
+    let operation_start = Instant::now();
+    // Extract configuration from event
+    let input_s3_manifest_url = event["input_s3_manifest_url"]
         .as_str()
-        .or(env::var("DEFAULT_SOURCE_BUCKET").ok().as_deref())
-        .unwrap_or_default()
+        .ok_or("'input_s3_manifest_url' not specified")?
         .to_string();
-    let target_bucket = event["target_bucket"]
+
+    let output_s3_url = event["output_s3_url"]
         .as_str()
-        .or(env::var("DEFAULT_TARGET_BUCKET").ok().as_deref())
-        .unwrap_or_default()
+        .ok_or("'output_s3_url' not specified")?
         .to_string();
-    let source_prefix = event["source_prefix"]
-        .as_str()
-        .or(env::var("DEFAULT_SOURCE_PREFIX").ok().as_deref())
-        .unwrap_or("logs/")
-        .to_string();
-    let target_prefix = event["target_prefix"]
-        .as_str()
-        .or(env::var("DEFAULT_TARGET_PREFIX").ok().as_deref())
-        .unwrap_or("compressed/")
-        .to_string();
+
+    let delete_source_files = event["delete_source_files"].as_bool().unwrap_or(false);
+
+    let (target_bucket, final_key) = parse_s3_url(&output_s3_url)?;
+
     let max_workers: usize = env::var("MAX_WORKERS")
         .unwrap_or_else(|_| "512".to_string())
         .parse()?;
     let kms_key_id = env::var("KMS_KEY_ID").ok();
 
     info!(
-        source_bucket,
-        target_bucket, source_prefix, target_prefix, "Configuration"
+        input_s3_manifest_url,
+        output_s3_url,
+        delete_source_files,
+        "Configuration"
     );
 
     // Create temporary directory for processing
@@ -96,26 +93,28 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let log_dir = tmp_dir.path().join("logs");
     fs::create_dir_all(&log_dir)?;
 
-    // Step 1: List all files to compress
-    let (keys, total_original_size) = list_keys(client, &source_bucket, &source_prefix).await?;
+    // Step 1: Download and parse the manifest file to get the list of S3 inputs
+    let inputs = download_and_parse_manifest(client, &input_s3_manifest_url).await?;
+    info!("Parsed {} inputs from manifest file", inputs.len());
+
+    // Step 2: List all files to compress from the S3 inputs
+    let (files_to_process, total_original_size) = list_files_from_inputs(client, &inputs).await?;
     info!(
         "Listed {} keys with a total size of {} bytes",
-        keys.len(),
+        files_to_process.len(),
         total_original_size
     );
 
-    // Step 2: Download all files concurrently
+    if files_to_process.is_empty() {
+        info!("No files to process. Exiting.");
+        return Ok(serde_json::json!({ "status": "ok", "message": "No files to process" }));
+    }
+
+    // Step 3: Download all files concurrently
     let start_dl = Instant::now();
-    download_files(
-        client,
-        &source_bucket,
-        &keys,
-        &log_dir,
-        &source_prefix,
-        max_workers,
-    )
-    .await?;
-    info!("Downloaded all files in {:.2?}", start_dl.elapsed());
+    download_files(client, &files_to_process, &log_dir, max_workers).await?;
+    let download_duration = start_dl.elapsed();
+    info!("Downloaded all files in {:.2?}", download_duration);
 
     // Recalculate total size from downloaded files
     let total_original_size = WalkDir::new(&log_dir)
@@ -130,13 +129,14 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
         "Calculated total size of original files"
     );
 
-    // Step 3: Create uncompressed zip archive
+    // Step 4: Create uncompressed zip archive
     let start_zip = Instant::now();
     let archive_zip_path = tmp_dir.path().join("archive.zip");
     zip_directory(&log_dir, &archive_zip_path, zip::CompressionMethod::Stored)?;
-    info!("Created .zip archive in {:.2?}", start_zip.elapsed());
+    let zip_duration = start_zip.elapsed();
+    info!("Created .zip archive in {:.2?}", zip_duration);
 
-    // Step 4: Compress zip file with zstd
+    // Step 5: Compress zip file with zstd
     let start_zst = Instant::now();
     let archive_zst_path = tmp_dir.path().join("archive.zip.zst");
     let mut zip_file = File::open(&archive_zip_path)?;
@@ -145,7 +145,11 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let compressed_data = encode_all(&zip_data[..], 3)?;
     let mut zst_file = File::create(&archive_zst_path)?;
     zst_file.write_all(&compressed_data)?;
-    info!("Compressed with zstd in {:.2?}", start_zst.elapsed());
+    let zstd_compress_duration = start_zst.elapsed();
+    info!(
+        "Compressed with zstd in {:.2?}",
+        zstd_compress_duration
+    );
 
     // Calculate compression metrics
     let compressed_size = fs::metadata(&archive_zst_path)?.len();
@@ -162,9 +166,8 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
         );
     }
 
-    // Step 5: Upload compressed archive to S3
+    // Step 6: Upload compressed archive to S3
     let start_upload = Instant::now();
-    let final_key = format!("{}archive.zip.zst", target_prefix);
     let stream = ByteStream::from_path(&archive_zst_path).await?;
 
     let mut put_object_request = client
@@ -179,86 +182,127 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     }
 
     put_object_request.send().await?;
-    info!("Uploaded to S3 in {:.2?}", start_upload.elapsed());
+    let upload_duration = start_upload.elapsed();
+    info!("Uploaded to S3 in {:.2?}", upload_duration);
 
-    // Step 6: Delete original files from source bucket in parallel batches
-    let start_delete = Instant::now();
-    if !keys.is_empty() {
-        let chunks = keys.chunks(1000); // S3 delete_objects has a limit of 1000 keys per request
-        let delete_futs = chunks.map(|chunk| {
-            let client = client.clone();
-            let source_bucket = source_bucket.clone();
-            let chunk_keys: Vec<String> = chunk.iter().map(|s| s.to_string()).collect();
-
-            async move {
-                let object_identifiers = chunk_keys
-                    .into_iter()
-                    .map(|key| {
-                        aws_sdk_s3::types::ObjectIdentifier::builder()
-                            .key(key)
-                            .build()
-                            .unwrap()
-                    })
-                    .collect::<Vec<_>>();
-
-                let delete_request = aws_sdk_s3::types::Delete::builder()
-                    .set_objects(Some(object_identifiers))
-                    .build()?;
-
-                client
-                    .delete_objects()
-                    .bucket(&source_bucket)
-                    .delete(delete_request)
-                    .send()
-                    .await
+    // Step 7: Delete original files from source bucket if requested
+    let mut delete_duration = None;
+    if delete_source_files {
+        let start_delete = Instant::now();
+        if !files_to_process.is_empty() {
+            // Group files by bucket
+            let mut files_by_bucket: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (bucket, key) in files_to_process {
+                files_by_bucket.entry(bucket).or_default().push(key);
             }
-        });
 
-        let results = futures::future::join_all(delete_futs).await;
-        let mut success_count = 0;
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(output) => {
-                    let deleted_count = output.deleted().len();
-                    success_count += deleted_count;
-                    info!(
-                        "Successfully deleted batch {} ({} objects)",
-                        i, deleted_count
-                    );
+            let delete_futs = files_by_bucket.into_iter().map(|(bucket, keys)| {
+                let client = client.clone();
+                async move {
+                    let chunks = keys.chunks(1000); // S3 delete_objects has a limit of 1000 keys per request
+                    let delete_futs_for_bucket = chunks.map(|chunk| {
+                        let client = client.clone();
+                        let bucket = bucket.clone();
+                        let chunk_keys: Vec<String> = chunk.iter().map(|s| s.to_string()).collect();
+
+                        async move {
+                            let object_identifiers = chunk_keys
+                                .into_iter()
+                                .map(|key| {
+                                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                                        .key(key)
+                                        .build()
+                                        .unwrap()
+                                })
+                                .collect::<Vec<_>>();
+
+                            let delete_request = aws_sdk_s3::types::Delete::builder()
+                                .set_objects(Some(object_identifiers))
+                                .build()?;
+
+                            client
+                                .delete_objects()
+                                .bucket(&bucket)
+                                .delete(delete_request)
+                                .send()
+                                .await
+                        }
+                    });
+                    futures::future::join_all(delete_futs_for_bucket).await
                 }
-                Err(e) => {
-                    error!("Failed to delete batch {}: {}", i, e);
+            });
+
+            let results_per_bucket = futures::future::join_all(delete_futs).await;
+            let mut total_success_count = 0;
+            for bucket_results in results_per_bucket {
+                for result in bucket_results {
+                    match result {
+                        Ok(output) => {
+                            let deleted_count = output.deleted().len();
+                            total_success_count += deleted_count;
+                            info!("Successfully deleted {} objects", deleted_count);
+                        }
+                        Err(e) => {
+                            error!("Failed to delete a batch of objects: {}", e);
+                        }
+                    }
                 }
             }
+            let elapsed = start_delete.elapsed();
+            delete_duration = Some(elapsed);
+            info!(
+                "Deleted {} original files in {:.2?}",
+                total_success_count, elapsed
+            );
         }
-        info!(
-            "Deleted {} original files in {:.2?}",
-            success_count,
-            start_delete.elapsed()
-        );
+    } else {
+        info!("Skipping deletion of source files as 'delete_source_files' is false.");
     }
 
-    Ok(serde_json::json!({ "status": "ok", "output_key": final_key }))
+    let total_runtime = operation_start.elapsed();
+    let total_runtime_secs = total_runtime.as_secs_f64();
+
+    let mut metrics = serde_json::json!({
+        "total_runtime": format!("{:.4}s", total_runtime_secs),
+        "download_time": format!("{:.4}s ({:.2}%)", download_duration.as_secs_f64(), (download_duration.as_secs_f64() / total_runtime_secs) * 100.0),
+        "zip_time": format!("{:.4}s ({:.2}%)", zip_duration.as_secs_f64(), (zip_duration.as_secs_f64() / total_runtime_secs) * 100.0),
+        "zstd_compress_time": format!("{:.4}s ({:.2}%)", zstd_compress_duration.as_secs_f64(), (zstd_compress_duration.as_secs_f64() / total_runtime_secs) * 100.0),
+        "upload_time": format!("{:.4}s ({:.2}%)", upload_duration.as_secs_f64(), (upload_duration.as_secs_f64() / total_runtime_secs) * 100.0),
+    });
+
+    if let Some(d) = delete_duration {
+        metrics["delete_time"] = serde_json::json!(format!(
+            "{:.4}s ({:.2}%)",
+            d.as_secs_f64(),
+            (d.as_secs_f64() / total_runtime_secs) * 100.0
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "output_key": final_key,
+        "metrics": metrics
+    }))
 }
 
 // Decompress archive and extract a specific file, returning it as base64
 async fn handle_decompression(client: &Client, event: &Value) -> Result<Value, Error> {
-    let source_bucket = event["source_bucket"]
+    let operation_start = Instant::now();
+    let source_s3_url = event["source_s3_url"]
         .as_str()
-        .ok_or("source_bucket not specified")?
-        .to_string();
-    let source_key = event["source_key"]
-        .as_str()
-        .ok_or("source_key not specified")?
+        .ok_or("source_s3_url not specified")?
         .to_string();
     let file_to_extract = event["file_to_extract"]
         .as_str()
         .ok_or("file_to_extract not specified")?
         .to_string();
 
+    let (source_bucket, source_key) = parse_s3_url(&source_s3_url)?;
+
     info!(
-        source_bucket,
-        source_key, file_to_extract, "Decompression Configuration"
+        source_s3_url,
+        file_to_extract, "Decompression Configuration"
     );
 
     // Step 1: Download compressed archive from S3
@@ -273,19 +317,21 @@ async fn handle_decompression(client: &Client, event: &Value) -> Result<Value, E
     while let Some(bytes) = object.body.next().await {
         zst_data.extend_from_slice(&bytes?);
     }
+    let download_duration = start_dl.elapsed();
     info!(
         "Downloaded {} bytes in {:.2?}",
         zst_data.len(),
-        start_dl.elapsed()
+        download_duration
     );
 
     // Step 2: Decompress zstd data back to zip
     let start_decompress = Instant::now();
     let zip_data = decode_all(&zst_data[..])?;
+    let zstd_decompress_duration = start_decompress.elapsed();
     info!(
         "Decompressed to {} bytes in {:.2?}",
         zip_data.len(),
-        start_decompress.elapsed()
+        zstd_decompress_duration
     );
 
     // Step 3: Extract specific file from zip archive
@@ -294,64 +340,130 @@ async fn handle_decompression(client: &Client, event: &Value) -> Result<Value, E
     let mut file = archive.by_name(&file_to_extract)?;
     let mut file_content = Vec::new();
     file.read_to_end(&mut file_content)?;
+    let unzip_duration = start_unzip.elapsed();
     info!(
         "Extracted '{}' ({} bytes) in {:.2?}",
         file_to_extract,
         file_content.len(),
-        start_unzip.elapsed()
+        unzip_duration
     );
 
     // Step 4: Encode file content as base64 for JSON response
     let encoded_content = STANDARD.encode(&file_content);
 
+    let total_runtime = operation_start.elapsed();
+    let total_runtime_secs = total_runtime.as_secs_f64();
+
     Ok(serde_json::json!({
         "status": "ok",
         "file_name": file_to_extract,
-        "file_content_base64": encoded_content
+        "file_content_base64": encoded_content,
+        "metrics": {
+            "total_runtime": format!("{:.4}s", total_runtime_secs),
+            "download_time": format!("{:.4}s ({:.2}%)", download_duration.as_secs_f64(), (download_duration.as_secs_f64() / total_runtime_secs) * 100.0),
+            "zstd_decompress_time": format!("{:.4}s ({:.2}%)", zstd_decompress_duration.as_secs_f64(), (zstd_decompress_duration.as_secs_f64() / total_runtime_secs) * 100.0),
+            "unzip_time": format!("{:.4}s ({:.2}%)", unzip_duration.as_secs_f64(), (unzip_duration.as_secs_f64() / total_runtime_secs) * 100.0)
+        }
     }))
 }
 
-// List all S3 objects under a given prefix and return keys with total size
-async fn list_keys(
+// Helper to download and parse a manifest file from S3
+async fn download_and_parse_manifest(
     client: &Client,
-    bucket: &str,
-    prefix: &str,
-) -> Result<(Vec<String>, u64), Error> {
-    let mut keys = Vec::new();
+    manifest_url: &str,
+) -> Result<Vec<String>, Error> {
+    let (bucket, key) = parse_s3_url(manifest_url)?;
+    let mut object = client
+        .get_object()
+        .bucket(&bucket)
+        .key(&key)
+        .send()
+        .await?;
+
+    let mut content = Vec::new();
+    while let Some(bytes) = object.body.next().await {
+        content.extend_from_slice(&bytes?);
+    }
+
+    let content_str = String::from_utf8(content)?;
+    let paths = content_str
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    Ok(paths)
+}
+
+// Helper to parse S3 URLs like "s3://bucket-name/key/path"
+fn parse_s3_url(s3_url: &str) -> Result<(String, String), Error> {
+    let stripped_url = s3_url.strip_prefix("s3://").ok_or("Invalid S3 URL format")?;
+    let mut parts = stripped_url.splitn(2, '/');
+    let bucket = parts.next().ok_or("Missing bucket in S3 URL")?.to_string();
+    let key = parts.next().unwrap_or("").to_string();
+    Ok((bucket, key))
+}
+
+// List all S3 objects from a list of S3 URLs (files or prefixes)
+async fn list_files_from_inputs(
+    client: &Client,
+    inputs: &[String],
+) -> Result<(Vec<(String, String)>, u64), Error> {
+    let mut files = Vec::new();
     let mut total_size: u64 = 0;
-    let mut stream = client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .into_paginator()
-        .send();
-    while let Some(result) = stream.next().await {
-        for obj in result?.contents() {
-            keys.push(obj.key().unwrap().to_string());
-            total_size += obj.size().unwrap_or(0) as u64;
+
+    for s3_url in inputs {
+        let (bucket, prefix) = parse_s3_url(s3_url)?;
+
+        if s3_url.ends_with('/') {
+            // It's a prefix (directory)
+            let mut stream = client
+                .list_objects_v2()
+                .bucket(&bucket)
+                .prefix(&prefix)
+                .into_paginator()
+                .send();
+            while let Some(result) = stream.next().await {
+                for obj in result?.contents() {
+                    if !obj.key().unwrap_or("").ends_with('/') {
+                        // Exclude "directory" objects
+                        let key = obj.key().unwrap().to_string();
+                        total_size += obj.size().unwrap_or(0) as u64;
+                        files.push((bucket.clone(), key));
+                    }
+                }
+            }
+        } else {
+            // It's a single file
+            let object = client
+                .head_object()
+                .bucket(&bucket)
+                .key(&prefix)
+                .send()
+                .await?;
+            total_size += object.content_length().unwrap_or(0) as u64;
+            files.push((bucket, prefix));
         }
     }
-    Ok((keys, total_size))
+    Ok((files, total_size))
 }
 
 // Download multiple S3 objects concurrently to local directory
 async fn download_files(
     client: &Client,
-    bucket: &str,
-    keys: &[String],
+    files_to_process: &[(String, String)],
     local_dir: &Path,
-    prefix: &str,
     max_workers: usize,
 ) -> Result<(), Error> {
-    stream::iter(keys)
-        .map(|key| {
+    stream::iter(files_to_process)
+        .map(|(bucket, key)| {
             let client = client.clone();
-            let bucket = bucket.to_string();
+            let bucket = bucket.clone();
             let key = key.clone();
             let local_dir = local_dir.to_path_buf();
-            let prefix = prefix.to_string();
             async move {
-                let rel_path = key.strip_prefix(&prefix).unwrap();
+                // Create a nested structure based on bucket and key
+                let rel_path = Path::new(&bucket).join(&key);
                 let local_path = local_dir.join(rel_path);
                 if let Some(parent) = local_path.parent() {
                     fs::create_dir_all(parent)?;
@@ -365,7 +477,11 @@ async fn download_files(
             }
         })
         .buffer_unordered(max_workers)
-        .for_each(|_| async {})
+        .for_each(|result| async {
+            if let Err(e) = result {
+                error!("Failed to download file: {}", e);
+            }
+        })
         .await;
     Ok(())
 }
@@ -387,13 +503,24 @@ fn zip_directory(
         let path = entry.path();
         let name = path.strip_prefix(src_dir).unwrap();
         if path.is_file() {
-            zip.start_file(name.to_str().unwrap(), options)?;
+            // Use path components to create a zip-compatible path
+            let zip_path = name
+                .components()
+                .map(|c| c.as_os_str().to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("/");
+            zip.start_file(zip_path, options)?;
             let mut f = File::open(path)?;
             let mut buffer = Vec::new();
             f.read_to_end(&mut buffer)?;
             zip.write_all(&buffer)?;
         } else if !name.as_os_str().is_empty() {
-            zip.add_directory(name.to_str().unwrap(), options)?;
+            let zip_path = name
+                .components()
+                .map(|c| c.as_os_str().to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("/");
+            zip.add_directory(zip_path, options)?;
         }
     }
     zip.finish()?;

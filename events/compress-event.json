@@ -1,7 +1,6 @@
 {
     "operation": "compress",
-    "source_bucket": "s3-log-compressor-sourcebucket-rkeoqdxsxu2w",
-    "target_bucket": "s3-log-compressor-targetbucket-rigrlmvweehm",
-    "source_prefix": "mock-logs/",
-    "target_prefix": "mock-logs/"
+    "input_s3_manifest_url": "s3://s3-log-compressor-sourcebucket-rkeoqdxsxu2w/manifest.txt",
+    "output_s3_url": "s3://s3-log-compressor-targetbucket-rigrlmvweehm/compressed/archive.zip.zst",
+    "delete_source_files": false
 }
