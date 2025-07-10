@@ -180,6 +180,7 @@ async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Er
 
     // Step 7: Delete original files from source bucket if requested
     let mut delete_duration = None;
+    let mut deletion_stats = None;
     if delete_source_files {
         let start_delete = Instant::now();
         if !files_to_process.is_empty() {
@@ -190,64 +191,65 @@ async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Er
                 files_by_bucket.entry(bucket).or_default().push(key);
             }
 
-            let delete_futs = files_by_bucket.into_iter().map(|(bucket, keys)| {
-                let client = client.clone();
-                async move {
-                    let chunks = keys.chunks(1000); // S3 delete_objects has a limit of 1000 keys per request
-                    let delete_futs_for_bucket = chunks.map(|chunk| {
-                        let client = client.clone();
-                        let bucket = bucket.clone();
-                        let chunk_keys: Vec<String> = chunk.iter().map(|s| s.to_string()).collect();
-
-                        async move {
-                            let object_identifiers = chunk_keys
-                                .into_iter()
-                                .map(|key| {
-                                    aws_sdk_s3::types::ObjectIdentifier::builder()
-                                        .key(key)
-                                        .build()
-                                        .unwrap()
-                                })
-                                .collect::<Vec<_>>();
-
-                            let delete_request = aws_sdk_s3::types::Delete::builder()
-                                .set_objects(Some(object_identifiers))
-                                .build()?;
-
-                            client
-                                .delete_objects()
-                                .bucket(&bucket)
-                                .delete(delete_request)
-                                .send()
-                                .await
-                        }
-                    });
-                    // Wait for all delete futures for this bucket
-                    futures::future::join_all(delete_futs_for_bucket).await
-                }
-            });
-
-            let results_per_bucket = futures::future::join_all(delete_futs).await;
             let mut total_success_count = 0;
-            for bucket_results in results_per_bucket {
-                for result in bucket_results {
-                    match result {
+            let mut total_failed_count = 0;
+            
+            // Process each bucket sequentially
+            for (bucket, keys) in files_by_bucket {
+                let chunks: Vec<_> = keys.chunks(1000).collect(); // S3 delete_objects has a limit of 1000 keys per request
+                
+                // Process each chunk of 1000 keys sequentially
+                for chunk in chunks {
+                    let object_identifiers = chunk
+                        .iter()
+                        .map(|key| {
+                            aws_sdk_s3::types::ObjectIdentifier::builder()
+                                .key(key)
+                                .build()
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+
+                    let delete_request = aws_sdk_s3::types::Delete::builder()
+                        .set_objects(Some(object_identifiers))
+                        .build()?;
+
+                    match client
+                        .delete_objects()
+                        .bucket(&bucket)
+                        .delete(delete_request)
+                        .send()
+                        .await
+                    {
                         Ok(output) => {
                             let deleted_count = output.deleted().len();
+                            let failed_count = output.errors().len();
                             total_success_count += deleted_count;
-                            info!("Successfully deleted {} objects", deleted_count);
+                            total_failed_count += failed_count;
+                            
+                            if failed_count > 0 {
+                                error!("Failed to delete {} objects from bucket {}", failed_count, bucket);
+                            }
+                            
+                            // Log progress every 10,000 successfully deleted files
+                            if total_success_count % 10000 == 0 {
+                                info!("Successfully deleted {} files so far...", total_success_count);
+                            }
                         }
                         Err(e) => {
-                            error!("Failed to delete a batch of objects: {}", e);
+                            error!("Failed to delete a batch of objects from bucket {}: {}", bucket, e);
+                            total_failed_count += chunk.len();
                         }
                     }
                 }
             }
+            
             let elapsed = start_delete.elapsed();
             delete_duration = Some(elapsed);
+            deletion_stats = Some((total_success_count, total_failed_count));
             info!(
-                "Deleted {} original files in {:.2?}",
-                total_success_count, elapsed
+                "Deletion completed: {} files successfully deleted, {} files failed to delete in {:.2?}",
+                total_success_count, total_failed_count, elapsed
             );
         }
     } else {
@@ -268,7 +270,7 @@ async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Er
         time_metrics["delete_time"] = serde_json::json!(format!("{:.4}s", d.as_secs_f64()));
     }
 
-    let data_metrics = serde_json::json!({
+    let mut data_metrics = serde_json::json!({
         "files_processed": files_processed,
         "s3_metadata_size_bytes": s3_metadata_size,
         "downloaded_size_bytes": downloaded_size,
@@ -279,6 +281,11 @@ async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Er
             "N/A".to_string()
         }
     });
+
+    if let Some((success_count, failed_count)) = deletion_stats {
+        data_metrics["files_deleted_successfully"] = serde_json::json!(success_count);
+        data_metrics["files_failed_to_delete"] = serde_json::json!(failed_count);
+    }
 
     Ok(serde_json::json!({
         "status": "ok",

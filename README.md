@@ -8,7 +8,7 @@ A simple AWS Lambda function that downloads multiple files from S3 and creates a
 - **Efficient Zipping**: Create zip archives with progress logging
 - **Cross-Bucket Support**: Works with files from multiple S3 buckets
 - **Optional Cleanup**: Delete source files after successful archiving
-- **Progress Tracking**: Logs progress every 10,000 files processed
+- **Progress Tracking**: Logs progress every 10,000 files processed and 50,000 files listed
 - **KMS Encryption**: Supports server-side encryption with KMS keys
 - **Concurrent Downloads**: Configurable worker threads for parallel processing
 - **Flexible Path Structure**: Option to include or exclude S3 bucket names in zip paths

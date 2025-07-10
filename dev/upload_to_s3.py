@@ -7,7 +7,8 @@ from tqdm import tqdm
 # Configuration constants
 S3_BUCKET = "s3-log-compressor-sourcebucket-rkeoqdxsxu2w"
 S3_TARGET_FOLDER = "mock-logs/"  # Target folder in S3
-LOCAL_LOGS_DIR = "mock_logs"
+# LOCAL_LOGS_DIR = "mock_logs"
+LOCAL_LOGS_DIR = "/Users/alan/Github/gz-vs-zstd/mock_logs"
 MAX_WORKERS = 100
 KMS_KEY_ID = os.environ.get("KMS_KEY_ID") # Get KMS key from environment variable
 
@@ -37,7 +38,7 @@ def upload_mock_logs():
         return
     
     # Get all JSON files from the mock_logs directory
-    log_files = [f for f in os.listdir(LOCAL_LOGS_DIR) if f.endswith('.json')]
+    log_files = [f for f in os.listdir(LOCAL_LOGS_DIR) if f.endswith('.json.gz')]
     
     if not log_files:
         print(f"No JSON files found in {LOCAL_LOGS_DIR}")
