@@ -1,20 +1,20 @@
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::{Client,primitives::ByteStream};
+use aws_sdk_s3::{primitives::ByteStream, Client};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures::stream::{self, StreamExt};
 use lambda_runtime::{service_fn, Error, LambdaEvent};
 use serde_json::Value;
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write, Cursor};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::time::Instant;
 use tempfile::tempdir;
-use tracing::{info, error, Level};
+use tracing::{error, info, Level};
 use walkdir::WalkDir;
 use zip::read::ZipArchive;
 use zip::write::{FileOptions, ZipWriter};
 use zstd::stream::{decode_all, encode_all};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -61,14 +61,35 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
 // Compress multiple files from S3 into a single zstd-compressed archive
 async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Error> {
     // Extract configuration from event or environment variables
-    let source_bucket = event["source_bucket"].as_str().or(env::var("DEFAULT_SOURCE_BUCKET").ok().as_deref()).unwrap_or_default().to_string();
-    let target_bucket = event["target_bucket"].as_str().or(env::var("DEFAULT_TARGET_BUCKET").ok().as_deref()).unwrap_or_default().to_string();
-    let source_prefix = event["source_prefix"].as_str().or(env::var("DEFAULT_SOURCE_PREFIX").ok().as_deref()).unwrap_or("logs/").to_string();
-    let target_prefix = event["target_prefix"].as_str().or(env::var("DEFAULT_TARGET_PREFIX").ok().as_deref()).unwrap_or("compressed/").to_string();
-    let max_workers: usize = env::var("MAX_WORKERS").unwrap_or_else(|_| "512".to_string()).parse()?;
+    let source_bucket = event["source_bucket"]
+        .as_str()
+        .or(env::var("DEFAULT_SOURCE_BUCKET").ok().as_deref())
+        .unwrap_or_default()
+        .to_string();
+    let target_bucket = event["target_bucket"]
+        .as_str()
+        .or(env::var("DEFAULT_TARGET_BUCKET").ok().as_deref())
+        .unwrap_or_default()
+        .to_string();
+    let source_prefix = event["source_prefix"]
+        .as_str()
+        .or(env::var("DEFAULT_SOURCE_PREFIX").ok().as_deref())
+        .unwrap_or("logs/")
+        .to_string();
+    let target_prefix = event["target_prefix"]
+        .as_str()
+        .or(env::var("DEFAULT_TARGET_PREFIX").ok().as_deref())
+        .unwrap_or("compressed/")
+        .to_string();
+    let max_workers: usize = env::var("MAX_WORKERS")
+        .unwrap_or_else(|_| "512".to_string())
+        .parse()?;
     let kms_key_id = env::var("KMS_KEY_ID").ok();
 
-    info!(source_bucket, target_bucket, source_prefix, target_prefix, "Configuration");
+    info!(
+        source_bucket,
+        target_bucket, source_prefix, target_prefix, "Configuration"
+    );
 
     // Create temporary directory for processing
     let tmp_dir = tempdir()?;
@@ -85,7 +106,15 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
 
     // Step 2: Download all files concurrently
     let start_dl = Instant::now();
-    download_files(client, &source_bucket, &keys, &log_dir, &source_prefix, max_workers).await?;
+    download_files(
+        client,
+        &source_bucket,
+        &keys,
+        &log_dir,
+        &source_prefix,
+        max_workers,
+    )
+    .await?;
     info!("Downloaded all files in {:.2?}", start_dl.elapsed());
 
     // Recalculate total size from downloaded files
@@ -96,7 +125,10 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
         .sum::<u64>();
-    info!(total_original_size_bytes = total_original_size, "Calculated total size of original files");
+    info!(
+        total_original_size_bytes = total_original_size,
+        "Calculated total size of original files"
+    );
 
     // Step 3: Create uncompressed zip archive
     let start_zip = Instant::now();
@@ -117,52 +149,144 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
 
     // Calculate compression metrics
     let compressed_size = fs::metadata(&archive_zst_path)?.len();
-    info!(compressed_size_bytes = compressed_size, "Calculated final compressed size");
+    info!(
+        compressed_size_bytes = compressed_size,
+        "Calculated final compressed size"
+    );
 
     if total_original_size > 0 {
         let ratio = compressed_size as f64 / total_original_size as f64;
-        info!(compression_ratio = format!("{:.4}", ratio), "Calculated compression ratio (compressed/original)");
+        info!(
+            compression_ratio = format!("{:.4}", ratio),
+            "Calculated compression ratio (compressed/original)"
+        );
     }
 
     // Step 5: Upload compressed archive to S3
     let start_upload = Instant::now();
     let final_key = format!("{}archive.zip.zst", target_prefix);
     let stream = ByteStream::from_path(&archive_zst_path).await?;
-    
-    let mut put_object_request = client.put_object().bucket(&target_bucket).key(&final_key).body(stream);
+
+    let mut put_object_request = client
+        .put_object()
+        .bucket(&target_bucket)
+        .key(&final_key)
+        .body(stream);
     if let Some(key_id) = kms_key_id {
         put_object_request = put_object_request
             .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
             .ssekms_key_id(key_id);
     }
-    
+
     put_object_request.send().await?;
     info!("Uploaded to S3 in {:.2?}", start_upload.elapsed());
+
+    // Step 6: Delete original files from source bucket in parallel batches
+    let start_delete = Instant::now();
+    if !keys.is_empty() {
+        let chunks = keys.chunks(1000); // S3 delete_objects has a limit of 1000 keys per request
+        let delete_futs = chunks.map(|chunk| {
+            let client = client.clone();
+            let source_bucket = source_bucket.clone();
+            let chunk_keys: Vec<String> = chunk.iter().map(|s| s.to_string()).collect();
+
+            async move {
+                let object_identifiers = chunk_keys
+                    .into_iter()
+                    .map(|key| {
+                        aws_sdk_s3::types::ObjectIdentifier::builder()
+                            .key(key)
+                            .build()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+
+                let delete_request = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(object_identifiers))
+                    .build()?;
+
+                client
+                    .delete_objects()
+                    .bucket(&source_bucket)
+                    .delete(delete_request)
+                    .send()
+                    .await
+            }
+        });
+
+        let results = futures::future::join_all(delete_futs).await;
+        let mut success_count = 0;
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(output) => {
+                    let deleted_count = output.deleted().len();
+                    success_count += deleted_count;
+                    info!(
+                        "Successfully deleted batch {} ({} objects)",
+                        i, deleted_count
+                    );
+                }
+                Err(e) => {
+                    error!("Failed to delete batch {}: {}", i, e);
+                }
+            }
+        }
+        info!(
+            "Deleted {} original files in {:.2?}",
+            success_count,
+            start_delete.elapsed()
+        );
+    }
 
     Ok(serde_json::json!({ "status": "ok", "output_key": final_key }))
 }
 
 // Decompress archive and extract a specific file, returning it as base64
 async fn handle_decompression(client: &Client, event: &Value) -> Result<Value, Error> {
-    let source_bucket = event["source_bucket"].as_str().ok_or("source_bucket not specified")?.to_string();
-    let source_key = event["source_key"].as_str().ok_or("source_key not specified")?.to_string();
-    let file_to_extract = event["file_to_extract"].as_str().ok_or("file_to_extract not specified")?.to_string();
+    let source_bucket = event["source_bucket"]
+        .as_str()
+        .ok_or("source_bucket not specified")?
+        .to_string();
+    let source_key = event["source_key"]
+        .as_str()
+        .ok_or("source_key not specified")?
+        .to_string();
+    let file_to_extract = event["file_to_extract"]
+        .as_str()
+        .ok_or("file_to_extract not specified")?
+        .to_string();
 
-    info!(source_bucket, source_key, file_to_extract, "Decompression Configuration");
+    info!(
+        source_bucket,
+        source_key, file_to_extract, "Decompression Configuration"
+    );
 
     // Step 1: Download compressed archive from S3
     let start_dl = Instant::now();
-    let mut object = client.get_object().bucket(&source_bucket).key(&source_key).send().await?;
+    let mut object = client
+        .get_object()
+        .bucket(&source_bucket)
+        .key(&source_key)
+        .send()
+        .await?;
     let mut zst_data = Vec::new();
     while let Some(bytes) = object.body.next().await {
         zst_data.extend_from_slice(&bytes?);
     }
-    info!("Downloaded {} bytes in {:.2?}", zst_data.len(), start_dl.elapsed());
+    info!(
+        "Downloaded {} bytes in {:.2?}",
+        zst_data.len(),
+        start_dl.elapsed()
+    );
 
     // Step 2: Decompress zstd data back to zip
     let start_decompress = Instant::now();
     let zip_data = decode_all(&zst_data[..])?;
-    info!("Decompressed to {} bytes in {:.2?}", zip_data.len(), start_decompress.elapsed());
+    info!(
+        "Decompressed to {} bytes in {:.2?}",
+        zip_data.len(),
+        start_decompress.elapsed()
+    );
 
     // Step 3: Extract specific file from zip archive
     let start_unzip = Instant::now();
@@ -170,7 +294,12 @@ async fn handle_decompression(client: &Client, event: &Value) -> Result<Value, E
     let mut file = archive.by_name(&file_to_extract)?;
     let mut file_content = Vec::new();
     file.read_to_end(&mut file_content)?;
-    info!("Extracted '{}' ({} bytes) in {:.2?}", file_to_extract, file_content.len(), start_unzip.elapsed());
+    info!(
+        "Extracted '{}' ({} bytes) in {:.2?}",
+        file_to_extract,
+        file_content.len(),
+        start_unzip.elapsed()
+    );
 
     // Step 4: Encode file content as base64 for JSON response
     let encoded_content = STANDARD.encode(&file_content);
@@ -206,7 +335,14 @@ async fn list_keys(
 }
 
 // Download multiple S3 objects concurrently to local directory
-async fn download_files(client: &Client, bucket: &str, keys: &[String], local_dir: &Path, prefix: &str, max_workers: usize) -> Result<(), Error> {
+async fn download_files(
+    client: &Client,
+    bucket: &str,
+    keys: &[String],
+    local_dir: &Path,
+    prefix: &str,
+    max_workers: usize,
+) -> Result<(), Error> {
     stream::iter(keys)
         .map(|key| {
             let client = client.clone();
@@ -235,7 +371,11 @@ async fn download_files(client: &Client, bucket: &str, keys: &[String], local_di
 }
 
 // Create a zip archive from a directory with specified compression method
-fn zip_directory(src_dir: &Path, dst_file: &Path, method: zip::CompressionMethod) -> zip::result::ZipResult<()> {
+fn zip_directory(
+    src_dir: &Path,
+    dst_file: &Path,
+    method: zip::CompressionMethod,
+) -> zip::result::ZipResult<()> {
     let file = File::create(dst_file)?;
     let mut zip = ZipWriter::new(file);
     let options = FileOptions::<()>::default().compression_method(method);

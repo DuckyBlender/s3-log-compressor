@@ -36,6 +36,14 @@ Resources:
   # S3 Buckets
   SourceBucket:
     Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteNoncurrentVersionsRule
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 7
 
   TargetBucket:
     Type: AWS::S3::Bucket
@@ -137,6 +145,12 @@ Resources:
             BucketName: !Ref TargetBucket
         - S3ReadPolicy:
             BucketName: !Ref TargetBucket
+        - Statement:
+          - Effect: Allow
+            Action:
+              - "s3:DeleteObject"
+              - "s3:DeleteObjectVersion"
+            Resource: !Sub "arn:aws:s3:::${SourceBucket}/*"
         - KMSDecryptPolicy:
             KeyId: !Ref KmsKey
         - Statement:
