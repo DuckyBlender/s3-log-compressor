@@ -1,5 +1,5 @@
 {
   "operation": "decompress",
-  "source_s3_url": "s3://s3-log-compressor-targetbucket-rigrlmvweehm/mock-logs/archive.zip.zst",
-  "file_to_extract": "log_0001.json"
+  "source_s3_url": "s3://s3-log-compressor-targetbucket-rigrlmvweehm/compressed/archive.zip.zst",
+  "file_to_extract": "s3-log-compressor-sourcebucket-rkeoqdxsxu2w/mock-logs/log_9999.json"
 }

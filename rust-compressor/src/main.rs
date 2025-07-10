@@ -4,6 +4,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures::stream::{self, StreamExt};
 use lambda_runtime::{service_fn, Error, LambdaEvent};
 use serde_json::Value;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
@@ -53,7 +54,9 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
         Err(e) => {
             let error_message = format!("{:#?}", e);
             error!("Operation failed: {}", error_message);
-            Ok(serde_json::json!({ "status": "error", "message": error_message }))
+            // To ensure a non-200 response, we should return an Err from the handler.
+            // The lambda runtime will serialize this into an error response.
+            Err(e)
         }
     }
 }
@@ -95,7 +98,14 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let inputs = download_and_parse_manifest(client, &input_s3_manifest_url).await?;
     info!("Parsed {} inputs from manifest file", inputs.len());
 
-    // Step 2: List all files to compress from the S3 inputs
+    // Step 2: Check bucket accessibility before proceeding
+    if let Err(e) = check_bucket_accessibility(client, &inputs).await {
+        error!("Bucket accessibility check failed: {}", e);
+        return Ok(serde_json::json!({ "status": "error", "message": e.to_string() }));
+    }
+    info!("All source buckets are accessible.");
+
+    // Step 3: List all files to compress from the S3 inputs
     let start_list = Instant::now();
     let (files_to_process, s3_metadata_size) = list_files_from_inputs(client, &inputs).await?;
     let list_files_duration = start_list.elapsed();
@@ -129,14 +139,14 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
         "Calculated total size of downloaded files"
     );
 
-    // Step 4: Create uncompressed zip archive
+    // Step 5: Create uncompressed zip archive
     let start_zip = Instant::now();
     let archive_zip_path = tmp_dir.path().join("archive.zip");
     zip_directory(&log_dir, &archive_zip_path, zip::CompressionMethod::Stored)?;
     let zip_duration = start_zip.elapsed();
     info!("Created .zip archive in {:.2?}", zip_duration);
 
-    // Step 5: Compress zip file with zstd
+    // Step 6: Compress zip file with zstd
     let start_zst = Instant::now();
     let archive_zst_path = tmp_dir.path().join("archive.zip.zst");
     let mut zip_file = File::open(&archive_zip_path)?;
@@ -163,7 +173,7 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
         );
     }
 
-    // Step 6: Upload compressed archive to S3
+    // Step 7: Upload compressed archive to S3
     let start_upload = Instant::now();
     let stream = ByteStream::from_path(&archive_zst_path).await?;
 
@@ -182,7 +192,7 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let upload_duration = start_upload.elapsed();
     info!("Uploaded to S3 in {:.2?}", upload_duration);
 
-    // Step 7: Delete original files from source bucket if requested
+    // Step 8: Delete original files from source bucket if requested
     let mut delete_duration = None;
     if delete_source_files {
         let start_delete = Instant::now();
@@ -294,6 +304,44 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
             "data": data_metrics
         }
     }))
+}
+
+// Helper to check accessibility of all buckets in the manifest
+async fn check_bucket_accessibility(client: &Client, inputs: &[String]) -> Result<(), Error> {
+    let mut unique_buckets = HashSet::new();
+    for s3_url in inputs {
+        let (bucket, _) = parse_s3_url(s3_url)?;
+        unique_buckets.insert(bucket);
+    }
+
+    let check_futs = unique_buckets.into_iter().map(|bucket| {
+        let client = client.clone();
+        async move {
+            match client.head_bucket().bucket(&bucket).send().await {
+                Ok(_) => Ok(None),
+                Err(_e) => Ok(Some(bucket)),
+            }
+        }
+    });
+
+    let results: Vec<Result<Option<String>, Error>> =
+        futures::future::join_all(check_futs).await;
+
+    let inaccessible_buckets: BTreeSet<String> = results
+        .into_iter()
+        .filter_map(|res| res.ok().flatten())
+        .collect();
+
+    if !inaccessible_buckets.is_empty() {
+        let bucket_list: Vec<String> = inaccessible_buckets.into_iter().collect();
+        let error_message = format!(
+            "Access denied for the following buckets: {}",
+            bucket_list.join(", ")
+        );
+        return Err(error_message.into());
+    }
+
+    Ok(())
 }
 
 // Decompress archive and extract a specific file, returning it as base64
