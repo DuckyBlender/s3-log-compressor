@@ -2117,7 +2117,6 @@ dependencies = [
  "async-stream",
  "aws-config",
  "aws-sdk-s3",
- "base64 0.22.1",
  "bytes",
  "futures",
  "lambda_runtime",
@@ -2129,7 +2128,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zip",
- "zstd",
 ]
 
 [[package]]
