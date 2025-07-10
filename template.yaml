@@ -134,15 +134,11 @@ Resources:
       Architectures:
         - arm64
       EphemeralStorage:
-        Size: 2048
+        Size: 10240
       MemorySize: 10240
       Timeout: 900
       Environment:
         Variables:
-          DEFAULT_SOURCE_BUCKET: !Ref SourceBucket
-          DEFAULT_TARGET_BUCKET: !Ref TargetBucket
-          DEFAULT_SOURCE_PREFIX: "logs/"
-          DEFAULT_TARGET_PREFIX: "compressed/"
           MAX_WORKERS: "256"
           KMS_KEY_ID: !Ref KmsKey
       VpcConfig:

@@ -2,5 +2,6 @@
   "operation": "compress",
   "input_s3_manifest_url": "s3://s3-log-compressor-sourcebucket-rkeoqdxsxu2w/example_manifest.txt",
   "output_s3_url": "s3://s3-log-compressor-targetbucket-rigrlmvweehm/compressed/archive.zip.zst",
-  "delete_source_files": false
+  "delete_source_files": false,
+  "compression_level": 3
 }

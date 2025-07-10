@@ -5,7 +5,7 @@ import string
 from tqdm import tqdm
 
 OUTPUT_DIR = "mock_logs"
-NUM_FILES = 10000
+NUM_FILES = 100000
 
 FIXED_KEYS = [
     "timestamp", "level", "message", "source_ip", "user_id", "request_id",
