@@ -18,6 +18,5 @@ tokio-stream = "0.1.17"
 async-stream = "0.3.6"
 zip = { version = "4.2", features = ["zstd"] }
 zstd = "0.13"
-walkdir = "2.5"
 tempfile = "3.20"
 base64 = "0.22.1"
