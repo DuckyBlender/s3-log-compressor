@@ -1,11 +1,11 @@
 # S3 Log Compressor
 
-A simple AWS Lambda function that downloads multiple files from S3 and creates a single zip archive. Perfect for archiving log files or consolidating multiple files into a single downloadable package. This project currently does not use zstd compression, last version that supported it was commit 65a0f5f0fe4becdec32bf96cdb63c6d6b135ef87 
+A simple AWS Lambda function that downloads multiple files from S3 and creates a single zip archive. Perfect for archiving log files or consolidating multiple files into a single downloadable package. The zip uses zstd for compression (mainly for paths and metadata)
 
 ## Features
 
 - **Batch Processing**: Process thousands of files from S3 manifest
-- **Efficient Zipping**: Create uncompressed zip archives with progress logging
+- **Efficient Zipping**: Create zip archives with progress logging
 - **Cross-Bucket Support**: Works with files from multiple S3 buckets
 - **Optional Cleanup**: Delete source files after successful archiving
 - **Progress Tracking**: Logs progress every 10,000 files processed

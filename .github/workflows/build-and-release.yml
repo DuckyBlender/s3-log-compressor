@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
@@ -81,13 +84,10 @@ jobs:
       
     - name: Create Release
       if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      uses: softprops/action-gh-release@v1
       with:
         tag_name: release-${{ steps.get_timestamp.outputs.timestamp }}-${{ steps.get_sha.outputs.short_sha }}
-        release_name: S3 Log Compressor ${{ steps.get_timestamp.outputs.timestamp }}
+        name: S3 Log Compressor ${{ steps.get_timestamp.outputs.timestamp }}
         body: |
           Automated release of S3 Log Compressor Lambda function
           
@@ -100,26 +100,10 @@ jobs:
           - Built from commit: ${{ github.sha }}
           - Binary compiled for ARM64 architecture
           - Optimized release build
-          
+        files: |
+          s3-log-compressor.zip
         draft: false
         prerelease: false
-        
-    - name: Upload Release Asset
-      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./s3-log-compressor.zip
-        asset_name: s3-log-compressor.zip
-        asset_content_type: application/zip
-        
-    - name: Output release info
-      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-      run: |
-        echo "Release created: ${{ steps.create_release.outputs.html_url }}"
-        echo "Download URL: ${{ steps.create_release.outputs.upload_url }}"
         
     - name: Build complete
       run: |

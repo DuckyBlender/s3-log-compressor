@@ -440,7 +440,7 @@ async fn download_and_create_zip(
     let total_downloaded_size = Arc::new(Mutex::new(0u64));
     let files_processed_count = Arc::new(Mutex::new(0u64));
 
-    let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+    let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Zstd);
     let total_files = files_to_process.len();
 
     stream::iter(files_to_process)
