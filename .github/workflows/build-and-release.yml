@@ -39,6 +39,12 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-
           
+    - name: Install Homebrew
+      run: |
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        echo "/home/linuxbrew/.linuxbrew/bin" >> $GITHUB_PATH
+        export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+        
     - name: Install cargo-lambda with Homebrew
       run: |
         # Install cargo-lambda (includes Zig dependency)
