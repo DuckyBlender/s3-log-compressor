@@ -96,11 +96,13 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     info!("Parsed {} inputs from manifest file", inputs.len());
 
     // Step 2: List all files to compress from the S3 inputs
-    let (files_to_process, total_original_size) = list_files_from_inputs(client, &inputs).await?;
+    let start_list = Instant::now();
+    let (files_to_process, s3_metadata_size) = list_files_from_inputs(client, &inputs).await?;
+    let list_files_duration = start_list.elapsed();
+    let files_processed = files_to_process.len();
     info!(
-        "Listed {} keys with a total size of {} bytes",
-        files_to_process.len(),
-        total_original_size
+        "Listed {} keys with a total S3 metadata size of {} bytes in {:.2?}",
+        files_processed, s3_metadata_size, list_files_duration
     );
 
     if files_to_process.is_empty() {
@@ -114,8 +116,8 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let download_duration = start_dl.elapsed();
     info!("Downloaded all files in {:.2?}", download_duration);
 
-    // Recalculate total size from downloaded files
-    let total_original_size = WalkDir::new(&log_dir)
+    // Recalculate total size from downloaded files for accuracy
+    let downloaded_size = WalkDir::new(&log_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -123,8 +125,8 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
         .map(|m| m.len())
         .sum::<u64>();
     info!(
-        total_original_size_bytes = total_original_size,
-        "Calculated total size of original files"
+        downloaded_size_bytes = downloaded_size,
+        "Calculated total size of downloaded files"
     );
 
     // Step 4: Create uncompressed zip archive
@@ -153,11 +155,11 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
         "Calculated final compressed size"
     );
 
-    if total_original_size > 0 {
-        let ratio = compressed_size as f64 / total_original_size as f64;
+    if downloaded_size > 0 {
+        let ratio = compressed_size as f64 / downloaded_size as f64;
         info!(
             compression_ratio = format!("{:.4}", ratio),
-            "Calculated compression ratio (compressed/original)"
+            "Calculated compression ratio (compressed/downloaded)"
         );
     }
 
@@ -224,6 +226,7 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
                                 .await
                         }
                     });
+                    // Wait for all delete futures for this bucket
                     futures::future::join_all(delete_futs_for_bucket).await
                 }
             });
@@ -258,26 +261,38 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let total_runtime = operation_start.elapsed();
     let total_runtime_secs = total_runtime.as_secs_f64();
 
-    let mut metrics = serde_json::json!({
+    let mut time_metrics = serde_json::json!({
         "total_runtime": format!("{:.4}s", total_runtime_secs),
-        "download_time": format!("{:.4}s ({:.2}%)", download_duration.as_secs_f64(), (download_duration.as_secs_f64() / total_runtime_secs) * 100.0),
-        "zip_time": format!("{:.4}s ({:.2}%)", zip_duration.as_secs_f64(), (zip_duration.as_secs_f64() / total_runtime_secs) * 100.0),
-        "zstd_compress_time": format!("{:.4}s ({:.2}%)", zstd_compress_duration.as_secs_f64(), (zstd_compress_duration.as_secs_f64() / total_runtime_secs) * 100.0),
-        "upload_time": format!("{:.4}s ({:.2}%)", upload_duration.as_secs_f64(), (upload_duration.as_secs_f64() / total_runtime_secs) * 100.0),
+        "list_files_time": format!("{:.4}s", list_files_duration.as_secs_f64()),
+        "download_time": format!("{:.4}s", download_duration.as_secs_f64()),
+        "zip_time": format!("{:.4}s", zip_duration.as_secs_f64()),
+        "zstd_compress_time": format!("{:.4}s", zstd_compress_duration.as_secs_f64()),
+        "upload_time": format!("{:.4}s", upload_duration.as_secs_f64()),
     });
 
     if let Some(d) = delete_duration {
-        metrics["delete_time"] = serde_json::json!(format!(
-            "{:.4}s ({:.2}%)",
-            d.as_secs_f64(),
-            (d.as_secs_f64() / total_runtime_secs) * 100.0
-        ));
+        time_metrics["delete_time"] = serde_json::json!(format!("{:.4}s", d.as_secs_f64()));
     }
+
+    let data_metrics = serde_json::json!({
+        "files_processed": files_processed,
+        "s3_metadata_size_bytes": s3_metadata_size,
+        "downloaded_size_bytes": downloaded_size,
+        "compressed_size_bytes": compressed_size,
+        "compression_ratio": if downloaded_size > 0 {
+            format!("{:.4}", compressed_size as f64 / downloaded_size as f64)
+        } else {
+            "N/A".to_string()
+        }
+    });
 
     Ok(serde_json::json!({
         "status": "ok",
         "output_key": final_key,
-        "metrics": metrics
+        "metrics": {
+            "time": time_metrics,
+            "data": data_metrics
+        }
     }))
 }
 
@@ -355,9 +370,9 @@ async fn handle_decompression(client: &Client, event: &Value) -> Result<Value, E
         "file_content_base64": encoded_content,
         "metrics": {
             "total_runtime": format!("{:.4}s", total_runtime_secs),
-            "download_time": format!("{:.4}s ({:.2}%)", download_duration.as_secs_f64(), (download_duration.as_secs_f64() / total_runtime_secs) * 100.0),
-            "zstd_decompress_time": format!("{:.4}s ({:.2}%)", zstd_decompress_duration.as_secs_f64(), (zstd_decompress_duration.as_secs_f64() / total_runtime_secs) * 100.0),
-            "unzip_time": format!("{:.4}s ({:.2}%)", unzip_duration.as_secs_f64(), (unzip_duration.as_secs_f64() / total_runtime_secs) * 100.0)
+            "download_time": format!("{:.4}s", download_duration.as_secs_f64()),
+            "zstd_decompress_time": format!("{:.4}s", zstd_decompress_duration.as_secs_f64()),
+            "unzip_time": format!("{:.4}s", unzip_duration.as_secs_f64())
         }
     }))
 }
