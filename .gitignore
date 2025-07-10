@@ -246,3 +246,4 @@ $RECYCLE.BIN/
 .aws-sam
 dev/mock_logs
 .DS_Store
+lambda.zip
