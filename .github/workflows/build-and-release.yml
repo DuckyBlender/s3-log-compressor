@@ -1,0 +1,97 @@
+name: Build and Release Lambda
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: aarch64-unknown-linux-gnu
+        
+    - name: Cache cargo dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          rust-compressor/target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+          
+    - name: Install cargo-lambda
+      run: |
+        curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-lambda/cargo-lambda/main/install.sh | sh
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+        
+    - name: Build Lambda function
+      run: |
+        cd rust-compressor
+        cargo lambda build --release --arm64
+        
+    - name: Create deployment package
+      run: |
+        cd rust-compressor/target/lambda/rust-compressor
+        zip -r ../../../../s3-log-compressor.zip bootstrap
+        
+    - name: Get commit SHA (short)
+      id: get_sha
+      run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      
+    - name: Get timestamp
+      id: get_timestamp
+      run: echo "timestamp=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+      
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: release-${{ steps.get_timestamp.outputs.timestamp }}-${{ steps.get_sha.outputs.short_sha }}
+        release_name: S3 Log Compressor ${{ steps.get_timestamp.outputs.timestamp }}
+        body: |
+          Automated release of S3 Log Compressor Lambda function
+          
+          **Commit:** ${{ github.sha }}
+          **Built on:** ${{ steps.get_timestamp.outputs.timestamp }}
+          
+          This release contains the compiled Lambda function ready for deployment.
+          
+          ### Changes in this release:
+          - Built from commit: ${{ github.sha }}
+          - Binary compiled for ARM64 architecture
+          - Optimized release build
+          
+        draft: false
+        prerelease: false
+        
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./s3-log-compressor.zip
+        asset_name: s3-log-compressor.zip
+        asset_content_type: application/zip
+        
+    - name: Output release info
+      run: |
+        echo "Release created: ${{ steps.create_release.outputs.html_url }}"
+        echo "Download URL: ${{ steps.create_release.outputs.upload_url }}"
