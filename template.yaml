@@ -162,31 +162,3 @@ Resources:
       #   - arn:aws:lambda:eu-central-1:534406734576:layer:zip-zstd-al2023-arm64:1
     Metadata:
       BuildMethod: rust-cargolambda
-
-  RustBenchmarkFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: rust-benchmark/
-      Handler: bootstrap
-      Runtime: provided.al2023
-      Architectures:
-        - arm64
-      EphemeralStorage:
-        Size: 2048
-      MemorySize: 10240
-      Timeout: 900
-      Environment:
-        Variables:
-          DEFAULT_SOURCE_BUCKET: !Ref SourceBucket
-          DEFAULT_SOURCE_PREFIX: "logs/"
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref LambdaSecurityGroup
-        SubnetIds:
-          - !Ref SubnetA
-          - !Ref SubnetB
-      Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref SourceBucket
-    Metadata:
-      BuildMethod: rust-cargolambda

@@ -83,9 +83,7 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
 
     info!(
         input_s3_manifest_url,
-        output_s3_url,
-        delete_source_files,
-        "Configuration"
+        output_s3_url, delete_source_files, "Configuration"
     );
 
     // Create temporary directory for processing
@@ -146,10 +144,7 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let mut zst_file = File::create(&archive_zst_path)?;
     zst_file.write_all(&compressed_data)?;
     let zstd_compress_duration = start_zst.elapsed();
-    info!(
-        "Compressed with zstd in {:.2?}",
-        zstd_compress_duration
-    );
+    info!("Compressed with zstd in {:.2?}", zstd_compress_duration);
 
     // Calculate compression metrics
     let compressed_size = fs::metadata(&archive_zst_path)?.len();
@@ -373,12 +368,7 @@ async fn download_and_parse_manifest(
     manifest_url: &str,
 ) -> Result<Vec<String>, Error> {
     let (bucket, key) = parse_s3_url(manifest_url)?;
-    let mut object = client
-        .get_object()
-        .bucket(&bucket)
-        .key(&key)
-        .send()
-        .await?;
+    let mut object = client.get_object().bucket(&bucket).key(&key).send().await?;
 
     let mut content = Vec::new();
     while let Some(bytes) = object.body.next().await {
@@ -397,7 +387,9 @@ async fn download_and_parse_manifest(
 
 // Helper to parse S3 URLs like "s3://bucket-name/key/path"
 fn parse_s3_url(s3_url: &str) -> Result<(String, String), Error> {
-    let stripped_url = s3_url.strip_prefix("s3://").ok_or("Invalid S3 URL format")?;
+    let stripped_url = s3_url
+        .strip_prefix("s3://")
+        .ok_or("Invalid S3 URL format")?;
     let mut parts = stripped_url.splitn(2, '/');
     let bucket = parts.next().ok_or("Missing bucket in S3 URL")?.to_string();
     let key = parts.next().unwrap_or("").to_string();

@@ -1,0 +1,1 @@
+s3://s3-log-compressor-sourcebucket-rkeoqdxsxu2w/mock-logs/
