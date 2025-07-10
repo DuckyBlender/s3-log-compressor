@@ -39,23 +39,18 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-
           
-    - name: Install cargo-lambda
+    - name: Install cargo-lambda with Homebrew
       run: |
-        # Install cargo-lambda using the official installation script
-        curl -fsSL https://cargo-lambda.info/install.sh | sh
-        
-        # Ensure cargo-lambda is in PATH
-        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-        export PATH="$HOME/.cargo/bin:$PATH"
+        # Install cargo-lambda (includes Zig dependency)
+        brew install cargo-lambda/tap/cargo-lambda
         
         # Verify installation
-        "$HOME/.cargo/bin/cargo-lambda" --version || cargo lambda --version
+        cargo lambda --version
         
     - name: Build Lambda function
       run: |
         cd rust-compressor
-        # Try cargo lambda first, fallback to full path
-        cargo lambda build --release --arm64 || "$HOME/.cargo/bin/cargo-lambda" build --release --arm64
+        cargo lambda build --release --arm64
         
     - name: Create deployment package
       run: |
