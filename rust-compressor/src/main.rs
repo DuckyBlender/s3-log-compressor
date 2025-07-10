@@ -15,7 +15,7 @@ use tempfile::tempdir;
 use tracing::{error, info, Level};
 use zip::read::ZipArchive;
 use zip::write::{FileOptions, ZipWriter};
-use zstd::stream::{decode_all, encode_all};
+use zstd::stream::decode_all;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -152,34 +152,22 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
         return Err(error_message.into());
     }
 
-    // Step 6: Compress zip file with zstd
+    // Step 6: Compress zip file with zstd (streaming to avoid loading into memory)
     let start_zst = Instant::now();
     let archive_zst_path = tmp_dir.path().join("archive.zip.zst");
-    let zip_data = {
-        let mut zip_file = File::open(&archive_zip_path)?;
-        let mut zip_data = Vec::new();
-        zip_file.read_to_end(&mut zip_data)?;
-        // Explicitly drop the file handle
-        drop(zip_file);
-        zip_data
-    };
-    let compressed_data = encode_all(&zip_data[..], 3)?;
-    {
-        let mut zst_file = File::create(&archive_zst_path)?;
-        zst_file.write_all(&compressed_data)?;
-        zst_file.flush()?;
-        // Explicitly drop the file handle
-        drop(zst_file);
-    }
+    let zip_file = File::open(&archive_zip_path)?;
+    let zst_file = File::create(&archive_zst_path)?;
+    
+    // Use streaming compression instead of loading entire file into memory
+    let mut encoder = zstd::stream::Encoder::new(zst_file, 3)?;
+    std::io::copy(&mut std::io::BufReader::new(zip_file), &mut encoder)?;
+    encoder.finish()?;
+    
     let zstd_compress_duration = start_zst.elapsed();
     info!("Compressed with zstd in {:.2?}", zstd_compress_duration);
 
     // Calculate compression metrics
-    let compressed_size = {
-        let metadata = fs::metadata(&archive_zst_path)?;
-        metadata.len()
-        // Metadata handle is automatically dropped here
-    };
+    let compressed_size = fs::metadata(&archive_zst_path)?.len();
     info!(
         compressed_size_bytes = compressed_size,
         "Calculated final compressed size"
@@ -212,16 +200,6 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     put_object_request.send().await?;
     let upload_duration = start_upload.elapsed();
     info!("Uploaded to S3 in {:.2?}", upload_duration);
-
-    // Explicitly delete files to release file handles before dropping temp dir
-    let _ = fs::remove_file(&archive_zip_path);
-    let _ = fs::remove_file(&archive_zst_path);
-
-    // Explicitly drop the temporary directory to release file handles
-    drop(tmp_dir);
-
-    // Force garbage collection and yield to allow cleanup
-    tokio::task::yield_now().await;
 
     // Step 8: Delete original files from source bucket if requested
     let mut delete_duration = None;
@@ -592,8 +570,6 @@ async fn download_and_zip_files(
                 while let Some(bytes) = object.body.next().await {
                     content.extend_from_slice(&bytes?);
                 }
-                // Explicitly drop the object to release the HTTP connection
-                drop(object);
 
                 let zip_path = Path::new(&bucket)
                     .join(&key)
@@ -601,14 +577,11 @@ async fn download_and_zip_files(
                     .unwrap()
                     .to_string();
 
-                {
-                    let mut size_guard = total_downloaded_size.lock().unwrap();
-                    *size_guard += content.len() as u64;
-                    let mut writer = zip_writer.lock().unwrap();
-                    writer.start_file(zip_path, options)?;
-                    writer.write_all(&content)?;
-                    // Explicitly release the locks
-                }
+                let mut size_guard = total_downloaded_size.lock().unwrap();
+                *size_guard += content.len() as u64;
+                let mut writer = zip_writer.lock().unwrap();
+                writer.start_file(zip_path, options)?;
+                writer.write_all(&content)?;
 
                 Ok::<(), Error>(())
             }
@@ -620,9 +593,6 @@ async fn download_and_zip_files(
             }
         })
         .await;
-
-    // Ensure all async operations are complete before proceeding
-    tokio::task::yield_now().await;
 
     let final_zip_writer = Arc::try_unwrap(zip_writer)
         .expect("Arc unwrap failed")
