@@ -69,7 +69,10 @@ jobs:
         
         # Create the zip package
         cd rust-compressor/target/lambda/rust-compressor
-        zip -r ../../../../s3-log-compressor.zip bootstrap
+        zip lambda.zip bootstrap
+        
+        # Move to root directory
+        mv lambda.zip ../../../../s3-log-compressor.zip
         
         # Verify the zip was created
         ls -la ../../../../s3-log-compressor.zip
