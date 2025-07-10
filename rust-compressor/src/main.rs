@@ -402,6 +402,11 @@ async fn list_files_from_inputs(
                         let key = obj.key().unwrap().to_string();
                         total_size += obj.size().unwrap_or(0) as u64;
                         files.push((bucket.clone(), key));
+                        
+                        // Log progress every 50,000 files discovered
+                        if files.len() % 50000 == 0 {
+                            info!("Discovered {} files so far...", files.len());
+                        }
                     }
                 }
             }
@@ -436,6 +441,7 @@ async fn download_and_create_zip(
     let files_processed_count = Arc::new(Mutex::new(0u64));
 
     let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+    let total_files = files_to_process.len();
 
     stream::iter(files_to_process)
         .map(|(bucket, key)| {
@@ -469,7 +475,8 @@ async fn download_and_create_zip(
                 let mut count_guard = files_processed_count.lock().unwrap();
                 *count_guard += 1;
                 if *count_guard % 10000 == 0 {
-                    info!("Downloaded and zipped {} files...", *count_guard);
+                    let percentage = (*count_guard as f64 / total_files as f64 * 100.0) as u32;
+                    info!("Downloaded and zipped {}/{} ({}%) files...", *count_guard, total_files, percentage);
                 }
 
                 Ok::<(), Error>(())
