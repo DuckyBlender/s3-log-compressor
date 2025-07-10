@@ -23,6 +23,11 @@ jobs:
         toolchain: stable
         targets: aarch64-unknown-linux-gnu
         
+    - name: Add cargo bin to PATH
+      run: |
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+        export PATH="$HOME/.cargo/bin:$PATH"
+        
     - name: Cache cargo dependencies
       uses: actions/cache@v3
       with:
@@ -36,18 +41,34 @@ jobs:
           
     - name: Install cargo-lambda
       run: |
-        curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-lambda/cargo-lambda/main/install.sh | sh
+        # Install cargo-lambda using the official installation script
+        curl -fsSL https://cargo-lambda.info/install.sh | sh
+        
+        # Ensure cargo-lambda is in PATH
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+        export PATH="$HOME/.cargo/bin:$PATH"
+        
+        # Verify installation
+        "$HOME/.cargo/bin/cargo-lambda" --version || cargo lambda --version
         
     - name: Build Lambda function
       run: |
         cd rust-compressor
-        cargo lambda build --release --arm64
+        # Try cargo lambda first, fallback to full path
+        cargo lambda build --release --arm64 || "$HOME/.cargo/bin/cargo-lambda" build --release --arm64
         
     - name: Create deployment package
       run: |
+        # Verify the build output exists
+        ls -la rust-compressor/target/lambda/
+        ls -la rust-compressor/target/lambda/rust-compressor/
+        
+        # Create the zip package
         cd rust-compressor/target/lambda/rust-compressor
         zip -r ../../../../s3-log-compressor.zip bootstrap
+        
+        # Verify the zip was created
+        ls -la ../../../../s3-log-compressor.zip
         
     - name: Get commit SHA (short)
       id: get_sha
@@ -58,6 +79,7 @@ jobs:
       run: echo "timestamp=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
       
     - name: Create Release
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
       id: create_release
       uses: actions/create-release@v1
       env:
@@ -82,6 +104,7 @@ jobs:
         prerelease: false
         
     - name: Upload Release Asset
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -92,6 +115,17 @@ jobs:
         asset_content_type: application/zip
         
     - name: Output release info
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
       run: |
         echo "Release created: ${{ steps.create_release.outputs.html_url }}"
         echo "Download URL: ${{ steps.create_release.outputs.upload_url }}"
+        
+    - name: Build complete
+      run: |
+        echo "Build completed successfully!"
+        echo "Zip file created: s3-log-compressor.zip"
+        if [ "${{ github.event_name }}" == "push" ] && ([ "${{ github.ref }}" == "refs/heads/main" ] || [ "${{ github.ref }}" == "refs/heads/master" ]); then
+          echo "Release will be created for this push to main/master"
+        else
+          echo "No release created - this is either a PR or not on main/master branch"
+        fi
