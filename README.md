@@ -23,9 +23,10 @@ A simple AWS Lambda function that downloads multiple files from S3 and creates a
 ```
 
 ## Prerequisites
-
+(for building and just lambda deployment)
 - [Rust](https://rustup.rs/) (rustup)
 - [Cargo Lambda](https://www.cargo-lambda.info/guide/getting-started.html)
+(for full deployment)
 - [AWS CLI](https://aws.amazon.com/cli/)
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
 
