@@ -1,5 +1,6 @@
 {
   "input_s3_manifest_url": "s3://s3-log-compressor-sourcebucket-rkeoqdxsxu2w/example_manifest.txt",
   "output_s3_url": "s3://s3-log-compressor-targetbucket-rigrlmvweehm/compressed/archive.zip",
-  "delete_source_files": false
+  "delete_source_files": false,
+  "include_s3_name": true
 }

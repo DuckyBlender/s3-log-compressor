@@ -11,6 +11,7 @@ A simple AWS Lambda function that downloads multiple files from S3 and creates a
 - **Progress Tracking**: Logs progress every 10,000 files processed
 - **KMS Encryption**: Supports server-side encryption with KMS keys
 - **Concurrent Downloads**: Configurable worker threads for parallel processing
+- **Flexible Path Structure**: Option to include or exclude S3 bucket names in zip paths
 
 ## Event Structure
 
@@ -18,9 +19,19 @@ A simple AWS Lambda function that downloads multiple files from S3 and creates a
 {
   "input_s3_manifest_url": "s3://bucket/manifest.txt",
   "output_s3_url": "s3://bucket/archive.zip",
-  "delete_source_files": false
+  "delete_source_files": false,
+  "include_s3_name": true
 }
 ```
+
+### Parameters
+
+- `input_s3_manifest_url`: S3 URL to a text file containing a list of files to archive
+- `output_s3_url`: S3 URL where the final zip archive will be stored
+- `delete_source_files`: Whether to delete source files after successful archiving (default: false)
+- `include_s3_name`: Whether to include S3 bucket names in the zip archive paths (default: true)
+
+When `include_s3_name` is `true`, files will be stored in the zip with paths like `bucket-name/path/to/file.txt`. When `false`, files will be stored with just their S3 key path like `path/to/file.txt`.
 
 ## Prerequisites
 (for building and just lambda deployment)

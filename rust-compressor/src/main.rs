@@ -73,6 +73,8 @@ async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Er
         .to_string();
 
     let delete_source_files = event["delete_source_files"].as_bool().unwrap_or(false);
+    
+    let include_s3_name = event["include_s3_name"].as_bool().unwrap_or(true);
 
     let (target_bucket, final_key) = parse_s3_url(&output_s3_url)?;
 
@@ -84,7 +86,7 @@ async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Er
 
     info!(
         input_s3_manifest_url,
-        output_s3_url, delete_source_files, "Configuration"
+        output_s3_url, delete_source_files, include_s3_name, "Configuration"
     );
 
     // Create temporary directory for processing
@@ -119,7 +121,7 @@ async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Er
     // Step 4: Download files and create zip archive
     let start_zip = Instant::now();
     let downloaded_size =
-        download_and_create_zip(client, &files_to_process, &tmp_dir, max_workers).await?;
+        download_and_create_zip(client, &files_to_process, &tmp_dir, max_workers, include_s3_name).await?;
     let zip_duration = start_zip.elapsed();
     info!("Downloaded and zipped all files in {:.2?}", zip_duration);
 
@@ -424,6 +426,7 @@ async fn download_and_create_zip(
     files_to_process: &[(String, String)],
     tmp_dir: &tempfile::TempDir,
     max_workers: usize,
+    include_s3_name: bool,
 ) -> Result<u64, Error> {
     // Create zip file in the temporary directory
     let zip_path = tmp_dir.path().join("archive.zip");
@@ -451,7 +454,11 @@ async fn download_and_create_zip(
                     content.extend_from_slice(&bytes?);
                 }
 
-                let zip_path = Path::new(&bucket).join(&key).to_str().unwrap().to_string();
+                let zip_path = if include_s3_name {
+                    Path::new(&bucket).join(&key).to_str().unwrap().to_string()
+                } else {
+                    key.clone()
+                };
 
                 let mut size_guard = total_downloaded_size.lock().unwrap();
                 *size_guard += content.len() as u64;
