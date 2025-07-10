@@ -87,7 +87,7 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     let (target_bucket, final_key) = parse_s3_url(&output_s3_url)?;
 
     let max_workers: usize = env::var("MAX_WORKERS")
-        .unwrap_or_else(|_| "512".to_string())
+        .unwrap_or_else(|_| "256".to_string())
         .parse()?;
     
     let kms_key_id = env::var("KMS_KEY_ID").ok();
@@ -175,7 +175,11 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
     info!("Compressed with zstd in {:.2?}", zstd_compress_duration);
 
     // Calculate compression metrics
-    let compressed_size = fs::metadata(&archive_zst_path)?.len();
+    let compressed_size = {
+        let metadata = fs::metadata(&archive_zst_path)?;
+        metadata.len()
+        // Metadata handle is automatically dropped here
+    };
     info!(
         compressed_size_bytes = compressed_size,
         "Calculated final compressed size"
@@ -191,15 +195,8 @@ async fn handle_compression(client: &Client, event: &Value) -> Result<Value, Err
 
     // Step 7: Upload compressed archive to S3
     let start_upload = Instant::now();
-    // Read compressed data into memory to avoid keeping file handle open during upload
-    let compressed_data_for_upload = {
-        let mut zst_file = File::open(&archive_zst_path)?;
-        let mut data = Vec::new();
-        zst_file.read_to_end(&mut data)?;
-        drop(zst_file);
-        data
-    };
-    let stream = ByteStream::from(compressed_data_for_upload);
+    // Use ByteStream::from_path for efficient streaming without loading into memory
+    let stream = ByteStream::from_path(&archive_zst_path).await?;
 
     let mut put_object_request = client
         .put_object()
@@ -623,6 +620,9 @@ async fn download_and_zip_files(
             }
         })
         .await;
+
+    // Ensure all async operations are complete before proceeding
+    tokio::task::yield_now().await;
 
     let final_zip_writer = Arc::try_unwrap(zip_writer)
         .expect("Arc unwrap failed")

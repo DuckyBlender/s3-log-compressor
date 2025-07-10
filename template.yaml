@@ -44,9 +44,22 @@ Resources:
           - Id: DeleteNoncurrentVersionsRule
             Status: Enabled
             NoncurrentVersionExpirationInDays: 7
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+            BucketKeyEnabled: true
 
   TargetBucket:
     Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+            BucketKeyEnabled: true
 
   # VPC
   MyVPC:
@@ -130,7 +143,7 @@ Resources:
           DEFAULT_TARGET_BUCKET: !Ref TargetBucket
           DEFAULT_SOURCE_PREFIX: "logs/"
           DEFAULT_TARGET_PREFIX: "compressed/"
-          MAX_WORKERS: "512"
+          MAX_WORKERS: "256"
           KMS_KEY_ID: !Ref KmsKey
       VpcConfig:
         SecurityGroupIds:
@@ -157,6 +170,7 @@ Resources:
           - Effect: Allow
             Action:
               - "kms:GenerateDataKey"
+              - "kms:Decrypt"
             Resource: !GetAtt KmsKey.Arn
       # Layers:
       #   - arn:aws:lambda:eu-central-1:534406734576:layer:zip-zstd-al2023-arm64:1
