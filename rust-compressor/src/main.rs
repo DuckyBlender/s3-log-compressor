@@ -1,18 +1,23 @@
 use aws_config::BehaviorVersion;
+use aws_sdk_s3::types::ServerSideEncryption;
 use aws_sdk_s3::{primitives::ByteStream, Client};
+use base64::{engine::general_purpose, Engine as _};
 use futures::stream::{self, StreamExt};
 use lambda_runtime::{service_fn, Error, LambdaEvent};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
-use std::io::Write;
+use std::fs::File as StdFile;
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tempfile::tempdir;
-use tokio::fs::{self, File};
+use tokio::fs;
 use tracing::{error, info, Level};
 use zip::write::{FileOptions, ZipWriter};
+
+const COMPRESSION_METHOD: zip::CompressionMethod = zip::CompressionMethod::Zstd;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -36,8 +41,13 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let client = Client::new(&config);
 
-    // Call the zip creation handler
-    let result = handle_zip_creation(&client, &event).await;
+    let operation = event["operation"].as_str().unwrap_or("compress");
+
+    let result = match operation {
+        "compress" => handle_compress_operation(&client, &event).await,
+        "decompress" => handle_decompress_operation(&client, &event).await,
+        _ => Err(Error::from("Invalid operation specified")),
+    };
 
     // Explicitly drop the client to release connection pool
     drop(client);
@@ -49,95 +59,125 @@ async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
     match result {
         Ok(value) => Ok(value),
         Err(e) => {
-            let error_message = format!("{:#?}", e);
-            error!("Operation failed: {}", error_message);
-            // To ensure a non-200 response, we should return an Err from the handler.
-            // The lambda runtime will serialize this into an error response.
-            Err(e)
+            error!("Error processing event: {}", e);
+            Ok(serde_json::json!({
+                "statusCode": 500,
+                "body": serde_json::json!({
+                    "error": e.to_string()
+                })
+            }))
         }
     }
 }
 
+async fn handle_decompress_operation(client: &Client, event: &Value) -> Result<Value, Error> {
+    let source_s3_url = event["source_s3_url"]
+        .as_str()
+        .ok_or_else(|| Error::from("Missing source_s3_url"))?;
+    let file_to_extract = event["file_to_extract"]
+        .as_str()
+        .ok_or_else(|| Error::from("Missing file_to_extract"))?;
+
+    let (bucket, key) = parse_s3_url(source_s3_url)?;
+
+    info!(
+        "Starting decompression for file {} from archive {}",
+        file_to_extract, source_s3_url
+    );
+
+    let object = client.get_object().bucket(bucket).key(key).send().await?;
+    let body_bytes = object.body.collect().await?.into_bytes();
+    let reader = std::io::Cursor::new(body_bytes);
+
+    let mut archive = zip::ZipArchive::new(reader)?;
+
+    let mut file = archive.by_name(file_to_extract)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+
+    let encoded_contents = general_purpose::STANDARD.encode(&contents);
+
+    Ok(serde_json::json!({
+        "file_content_base64": encoded_contents
+    }))
+}
+
 // Create a zip archive from multiple files from S3
-async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Error> {
+async fn handle_compress_operation(client: &Client, event: &Value) -> Result<Value, Error> {
     let operation_start = Instant::now();
     // Extract configuration from event
     let input_s3_manifest_url = event["input_s3_manifest_url"]
         .as_str()
-        .ok_or("'input_s3_manifest_url' not specified")?
-        .to_string();
+        .ok_or_else(|| Error::from("Missing input_s3_manifest_url"))?;
 
     let output_s3_url = event["output_s3_url"]
         .as_str()
-        .ok_or("'output_s3_url' not specified")?
-        .to_string();
+        .ok_or_else(|| Error::from("Missing output_s3_url"))?;
 
     let delete_source_files = event["delete_source_files"].as_bool().unwrap_or(false);
-    
     let include_s3_name = event["include_s3_name"].as_bool().unwrap_or(true);
+    let max_workers: usize = event["max_workers"]
+        .as_u64()
+        .unwrap_or(256)
+        .try_into()
+        .unwrap_or(256);
 
-    let (target_bucket, final_key) = parse_s3_url(&output_s3_url)?;
-
-    let max_workers: usize = env::var("MAX_WORKERS")
-        .unwrap_or_else(|_| "256".to_string())
-        .parse()?;
+    let (target_bucket, final_key) = parse_s3_url(output_s3_url)?;
 
     let kms_key_id = env::var("KMS_KEY_ID").ok();
 
     info!(
-        input_s3_manifest_url,
-        output_s3_url, delete_source_files, include_s3_name, "Configuration"
+        "Starting zip creation from manifest: {} to {}",
+        input_s3_manifest_url, output_s3_url
     );
 
     // Create temporary directory for processing
     let tmp_dir = tempdir()?;
 
     // Step 1: Download and parse the manifest file to get the list of S3 inputs
-    let inputs = download_and_parse_manifest(client, &input_s3_manifest_url).await?;
+    let inputs = download_and_parse_manifest(client, input_s3_manifest_url).await?;
     info!("Parsed {} inputs from manifest file", inputs.len());
 
     // Step 2: Check bucket accessibility before proceeding
-    if let Err(e) = check_bucket_accessibility(client, &inputs).await {
-        error!("Bucket accessibility check failed: {}", e);
-        return Ok(serde_json::json!({ "status": "error", "message": e.to_string() }));
-    }
+    check_bucket_accessibility(client, &inputs).await?;
     info!("All source buckets are accessible.");
 
     // Step 3: List all files to zip from the S3 inputs
     let start_list = Instant::now();
-    let (files_to_process, s3_metadata_size) = list_files_from_inputs(client, &inputs).await?;
+    let files_to_process = list_files_from_inputs(client, &inputs).await?;
     let list_files_duration = start_list.elapsed();
     let files_processed = files_to_process.len();
     info!(
-        "Listed {} keys with a total S3 metadata size of {} bytes in {:.2?}",
-        files_processed, s3_metadata_size, list_files_duration
+        "Listed {} files to process in {:.2?}.",
+        files_processed, list_files_duration,
     );
 
     if files_to_process.is_empty() {
-        info!("No files to process. Exiting.");
-        return Ok(serde_json::json!({ "status": "ok", "message": "No files to process" }));
+        return Err(Error::from("No files to process."));
     }
 
     // Step 4: Download files and create zip archive
     let start_zip = Instant::now();
-    let downloaded_size =
-        download_and_create_zip(client, &files_to_process, &tmp_dir, max_workers, include_s3_name).await?;
+    let (downloaded_size, successful_downloads, failed_downloads) = download_and_create_zip(
+        client,
+        &files_to_process,
+        &tmp_dir,
+        max_workers,
+        include_s3_name,
+    )
+    .await?;
     let zip_duration = start_zip.elapsed();
     info!("Downloaded and zipped all files in {:.2?}", zip_duration);
 
     info!(
-        downloaded_size_bytes = downloaded_size,
-        "Calculated total size of downloaded files"
+        "Download stats: {} successful, {} failed.",
+        successful_downloads, failed_downloads
     );
 
-    // Add validation step to ensure downloaded bytes match S3 metadata
-    if s3_metadata_size != downloaded_size {
-        let error_message = format!(
-            "Mismatch between S3 metadata size ({}) and downloaded size ({}).",
-            s3_metadata_size, downloaded_size
-        );
-        error!("{}", error_message);
-        return Err(error_message.into());
+    if failed_downloads > 0 {
+        return Err(Error::from(format!(
+            "Failed to download {failed_downloads} files. Aborting."
+        )));
     }
 
     // Step 5: Get zip file path and calculate metrics
@@ -146,16 +186,16 @@ async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Er
     // Calculate zip metrics
     let zipped_size = fs::metadata(&archive_path).await?.len();
     info!(
-        zipped_size_bytes = zipped_size,
-        "Calculated final zipped size"
+        "Zip archive created at: {}. Size: {} bytes",
+        archive_path.display(),
+        zipped_size
     );
 
+    let mut compression_ratio = None;
     if downloaded_size > 0 {
         let ratio = zipped_size as f64 / downloaded_size as f64;
-        info!(
-            compression_ratio = format!("{:.4}", ratio),
-            "Calculated compression ratio (zipped/downloaded)"
-        );
+        compression_ratio = Some(ratio);
+        info!("Compression ratio: {:.4}", ratio);
     }
 
     // Step 6: Upload zip archive to S3
@@ -170,129 +210,59 @@ async fn handle_zip_creation(client: &Client, event: &Value) -> Result<Value, Er
         .body(stream);
     if let Some(key_id) = kms_key_id {
         put_object_request = put_object_request
-            .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .server_side_encryption(ServerSideEncryption::AwsKms)
             .ssekms_key_id(key_id);
     }
-
     put_object_request.send().await?;
     let upload_duration = start_upload.elapsed();
     info!("Uploaded to S3 in {:.2?}", upload_duration);
 
     // Step 7: Delete original files from source bucket if requested
-    let mut delete_duration = None;
-    let mut deletion_stats = None;
     if delete_source_files {
-        let start_delete = Instant::now();
-        if !files_to_process.is_empty() {
-            // Group files by bucket
-            let mut files_by_bucket: HashMap<String, Vec<String>> =
-                HashMap::new();
-            for (bucket, key) in files_to_process {
-                files_by_bucket.entry(bucket).or_default().push(key);
+        info!("Starting asynchronous deletion of source files.");
+        let client_clone = client.clone();
+        let files_to_delete = files_to_process.clone();
+        tokio::spawn(async move {
+            match delete_files_in_batches(&client_clone, &files_to_delete).await {
+                Ok((success, fail)) => info!(
+                    "Async deletion completed: {} successful, {} failed.",
+                    success, fail
+                ),
+                Err(e) => error!("Async deletion failed: {}", e),
             }
-
-            let mut total_success_count = 0;
-            let mut total_failed_count = 0;
-            
-            // Process each bucket sequentially
-            for (bucket, keys) in files_by_bucket {
-                let chunks: Vec<_> = keys.chunks(1000).collect(); // S3 delete_objects has a limit of 1000 keys per request
-                
-                // Process each chunk of 1000 keys sequentially
-                for chunk in chunks {
-                    let object_identifiers = chunk
-                        .iter()
-                        .map(|key| {
-                            aws_sdk_s3::types::ObjectIdentifier::builder()
-                                .key(key)
-                                .build()
-                                .unwrap()
-                        })
-                        .collect::<Vec<_>>();
-
-                    let delete_request = aws_sdk_s3::types::Delete::builder()
-                        .set_objects(Some(object_identifiers))
-                        .build()?;
-
-                    match client
-                        .delete_objects()
-                        .bucket(&bucket)
-                        .delete(delete_request)
-                        .send()
-                        .await
-                    {
-                        Ok(output) => {
-                            let deleted_count = output.deleted().len();
-                            let failed_count = output.errors().len();
-                            total_success_count += deleted_count;
-                            total_failed_count += failed_count;
-                            
-                            if failed_count > 0 {
-                                error!("Failed to delete {} objects from bucket {}", failed_count, bucket);
-                            }
-                            
-                            // Log progress every 10,000 successfully deleted files
-                            if total_success_count % 10000 == 0 {
-                                info!("Successfully deleted {} files so far...", total_success_count);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to delete a batch of objects from bucket {}: {}", bucket, e);
-                            total_failed_count += chunk.len();
-                        }
-                    }
-                }
-            }
-            
-            let elapsed = start_delete.elapsed();
-            delete_duration = Some(elapsed);
-            deletion_stats = Some((total_success_count, total_failed_count));
-            info!(
-                "Deletion completed: {} files successfully deleted, {} files failed to delete in {:.2?}",
-                total_success_count, total_failed_count, elapsed
-            );
-        }
+        });
     } else {
-        info!("Skipping deletion of source files as 'delete_source_files' is false.");
+        info!("Skipping deletion of source files.");
     }
 
     let total_runtime = operation_start.elapsed();
     let total_runtime_secs = total_runtime.as_secs_f64();
 
-    let mut time_metrics = serde_json::json!({
+    let time_metrics = serde_json::json!({
         "total_runtime": format!("{:.4}s", total_runtime_secs),
         "list_files_time": format!("{:.4}s", list_files_duration.as_secs_f64()),
-        "download_and_zip_time": format!("{:.4}s", zip_duration.as_secs_f64()),
+        "zip_creation_time": format!("{:.4}s", zip_duration.as_secs_f64()),
         "upload_time": format!("{:.4}s", upload_duration.as_secs_f64()),
     });
 
-    if let Some(d) = delete_duration {
-        time_metrics["delete_time"] = serde_json::json!(format!("{:.4}s", d.as_secs_f64()));
-    }
-
     let mut data_metrics = serde_json::json!({
         "files_processed": files_processed,
-        "s3_metadata_size_bytes": s3_metadata_size,
-        "downloaded_size_bytes": downloaded_size,
-        "zipped_size_bytes": zipped_size,
-        "compression_ratio": if downloaded_size > 0 {
-            format!("{:.4}", zipped_size as f64 / downloaded_size as f64)
-        } else {
-            "N/A".to_string()
-        }
+        "successful_downloads": successful_downloads,
+        "failed_downloads": failed_downloads,
+        "total_uncompressed_bytes": downloaded_size,
+        "total_compressed_bytes": zipped_size,
     });
 
-    if let Some((success_count, failed_count)) = deletion_stats {
-        data_metrics["files_deleted_successfully"] = serde_json::json!(success_count);
-        data_metrics["files_failed_to_delete"] = serde_json::json!(failed_count);
+    if let Some(ratio) = compression_ratio {
+        data_metrics["compression_ratio"] = serde_json::json!(ratio);
     }
 
     Ok(serde_json::json!({
-        "status": "ok",
-        "output_key": final_key,
+        "status": "success",
+        "output_s3_url": output_s3_url,
         "metrics": {
             "time": time_metrics,
-            "data": data_metrics
+            "data": data_metrics,
         }
     }))
 }
@@ -310,7 +280,7 @@ async fn check_bucket_accessibility(client: &Client, inputs: &[String]) -> Resul
         async move {
             match client.head_bucket().bucket(&bucket).send().await {
                 Ok(_) => Ok(None),
-                Err(_e) => Ok(Some(bucket)),
+                Err(_) => Ok(Some(bucket)),
             }
         }
     });
@@ -319,16 +289,18 @@ async fn check_bucket_accessibility(client: &Client, inputs: &[String]) -> Resul
 
     let inaccessible_buckets: BTreeSet<String> = results
         .into_iter()
-        .filter_map(|res| res.ok().flatten())
+        .filter_map(Result::ok)
+        .flatten()
         .collect();
 
     if !inaccessible_buckets.is_empty() {
-        let bucket_list: Vec<String> = inaccessible_buckets.into_iter().collect();
-        let error_message = format!(
-            "Access denied for the following buckets: {}",
-            bucket_list.join(", ")
-        );
-        return Err(error_message.into());
+        let bucket_list = inaccessible_buckets
+            .into_iter()
+            .collect::<Vec<String>>()
+            .join(", ");
+        return Err(Error::from(format!(
+            "The following buckets are not accessible: {bucket_list}"
+        )));
     }
 
     Ok(())
@@ -344,17 +316,7 @@ async fn download_and_parse_manifest(
 
     let mut object = match object_result {
         Ok(o) => o,
-        Err(e) => {
-            let service_error = e.into_service_error();
-            if service_error.is_no_such_key() {
-                return Err(format!("Manifest file not found at {}", manifest_url).into());
-            }
-            return Err(format!(
-                "Failed to download manifest from {}: {}",
-                manifest_url, service_error
-            )
-            .into());
-        }
+        Err(e) => return Err(Error::from(format!("Failed to get manifest from S3: {e}"))),
     };
 
     let mut content = Vec::new();
@@ -387,49 +349,41 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String), Error> {
 async fn list_files_from_inputs(
     client: &Client,
     inputs: &[String],
-) -> Result<(Vec<(String, String)>, u64), Error> {
+) -> Result<Vec<(String, String)>, Error> {
     let mut files = Vec::new();
-    let mut total_size: u64 = 0;
 
     for s3_url in inputs {
-        let (bucket, prefix) = parse_s3_url(s3_url)?;
-
+        let (bucket, key) = parse_s3_url(s3_url)?;
         if s3_url.ends_with('/') {
-            // It's a prefix (directory)
+            // It's a directory, list objects
             let mut stream = client
                 .list_objects_v2()
                 .bucket(&bucket)
-                .prefix(&prefix)
+                .prefix(&key)
                 .into_paginator()
                 .send();
+
             while let Some(result) = stream.next().await {
-                for obj in result?.contents() {
-                    if !obj.key().unwrap_or("").ends_with('/') {
-                        // Exclude "directory" objects
-                        let key = obj.key().unwrap().to_string();
-                        total_size += obj.size().unwrap_or(0) as u64;
-                        files.push((bucket.clone(), key));
-                        
-                        // Log progress every 50,000 files discovered
-                        if files.len() % 50000 == 0 {
-                            info!("Discovered {} files so far...", files.len());
+                match result {
+                    Ok(output) => {
+                        for object in output.contents() {
+                            if !object.key().unwrap_or("").ends_with('/') {
+                                files.push((bucket.clone(), object.key().unwrap().to_string()));
+                            }
                         }
+                    }
+                    Err(e) => {
+                        error!("Failed to list objects for prefix {}: {}", s3_url, e);
+                        return Err(e.into());
                     }
                 }
             }
         } else {
-            // It's a single file
-            let object = client
-                .head_object()
-                .bucket(&bucket)
-                .key(&prefix)
-                .send()
-                .await?;
-            total_size += object.content_length().unwrap_or(0) as u64;
-            files.push((bucket, prefix));
+            // It's a file
+            files.push((bucket, key));
         }
     }
-    Ok((files, total_size))
+    Ok(files)
 }
 
 // Download files from S3 and create a zip archive using temporary files
@@ -439,71 +393,194 @@ async fn download_and_create_zip(
     tmp_dir: &tempfile::TempDir,
     max_workers: usize,
     include_s3_name: bool,
-) -> Result<u64, Error> {
-    // Create zip file in the temporary directory
+) -> Result<(u64, usize, usize), Error> {
     let zip_path = tmp_dir.path().join("archive.zip");
-    let zip_file = File::create(&zip_path).await?;
-    let zip_writer = Arc::new(Mutex::new(ZipWriter::new(zip_file.into_std().await)));
-    let total_downloaded_size = Arc::new(Mutex::new(0u64));
-    let files_processed_count = Arc::new(Mutex::new(0u64));
+    let zip_file = StdFile::create(&zip_path)?;
+    let writer = Arc::new(Mutex::new(ZipWriter::new(BufWriter::new(zip_file))));
 
-    let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Zstd);
-    let total_files = files_to_process.len();
+    let total_size = Arc::new(Mutex::new(0u64));
+    let successful_downloads = Arc::new(Mutex::new(0usize));
+    let failed_downloads = Arc::new(Mutex::new(0usize));
 
-    stream::iter(files_to_process)
-        .map(|(bucket, key)| {
-            let client = client.clone();
-            let bucket = bucket.clone();
-            let key = key.clone();
-            let zip_writer = Arc::clone(&zip_writer);
-            let total_downloaded_size = Arc::clone(&total_downloaded_size);
-            let files_processed_count = Arc::clone(&files_processed_count);
+    let download_futs = files_to_process.iter().map(|(bucket, key)| {
+        let client = client.clone();
+        let writer = Arc::clone(&writer);
+        let total_size = Arc::clone(&total_size);
+        let successful_downloads = Arc::clone(&successful_downloads);
+        let failed_downloads = Arc::clone(&failed_downloads);
+        let bucket = bucket.clone();
+        let key = key.clone();
 
-            async move {
-                let object_result = client.get_object().bucket(&bucket).key(&key).send().await?;
-                let mut object = object_result;
-                let mut content = Vec::new();
-                while let Some(bytes) = object.body.next().await {
-                    content.extend_from_slice(&bytes?);
+        async move {
+            let object_result = client.get_object().bucket(&bucket).key(&key).send().await;
+
+            match object_result {
+                Ok(mut object) => {
+                    let mut byte_vec = Vec::new();
+                    let mut downloaded_size = 0;
+                    while let Some(bytes_result) = object.body.next().await {
+                        match bytes_result {
+                            Ok(bytes) => {
+                                downloaded_size += bytes.len();
+                                byte_vec.extend_from_slice(&bytes);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to download chunk for s3://{}/{}: {}",
+                                    bucket, key, e
+                                );
+                                *failed_downloads.lock().unwrap() += 1;
+                                return Err(Error::from(e.to_string()));
+                            }
+                        }
+                    }
+
+                    let zip_path = if include_s3_name {
+                        format!("{bucket}/{key}")
+                    } else {
+                        Path::new(&key)
+                            .file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    };
+
+                    let options =
+                        FileOptions::<()>::default().compression_method(COMPRESSION_METHOD);
+                    let write_result = tokio::task::spawn_blocking(move || {
+                        let mut writer_guard = writer.lock().unwrap();
+                        writer_guard.start_file(zip_path, options)?;
+                        writer_guard.write_all(&byte_vec)?;
+                        Ok::<(), std::io::Error>(())
+                    })
+                    .await;
+
+                    match write_result {
+                        Ok(Ok(_)) => {
+                            *total_size.lock().unwrap() += downloaded_size as u64;
+                            *successful_downloads.lock().unwrap() += 1;
+                            Ok(())
+                        }
+                        Ok(Err(e)) => {
+                            error!(
+                                "Failed to write to zip file for s3://{}/{}: {}",
+                                bucket, key, e
+                            );
+                            *failed_downloads.lock().unwrap() += 1;
+                            Err(Error::from(e.to_string()))
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to write to zip file task panicked for s3://{}/{}: {}",
+                                bucket, key, e
+                            );
+                            *failed_downloads.lock().unwrap() += 1;
+                            Err(Error::from(e.to_string()))
+                        }
+                    }
                 }
-
-                let zip_path = if include_s3_name {
-                    Path::new(&bucket).join(&key).to_str().unwrap().to_string()
-                } else {
-                    key.clone()
-                };
-
-                let mut size_guard = total_downloaded_size.lock().unwrap();
-                *size_guard += content.len() as u64;
-                let mut writer = zip_writer.lock().unwrap();
-                writer.start_file(zip_path, options)?;
-                writer.write_all(&content)?;
-
-                let mut count_guard = files_processed_count.lock().unwrap();
-                *count_guard += 1;
-                if *count_guard % 10000 == 0 {
-                    let percentage = (*count_guard as f64 / total_files as f64 * 100.0) as u32;
-                    info!("Downloaded and zipped {}/{} ({}%) files...", *count_guard, total_files, percentage);
+                Err(e) => {
+                    error!("Failed to get object s3://{}/{}: {}", bucket, key, e);
+                    *failed_downloads.lock().unwrap() += 1;
+                    Err(Error::from(e.to_string()))
                 }
-
-                Ok::<(), Error>(())
             }
-        })
-        .buffer_unordered(max_workers)
-        .for_each(|result| async {
-            if let Err(e) = result {
-                error!("Failed to download and zip file: {}", e);
-            }
-        })
-        .await;
+        }
+    });
 
-    // Finish the zip file
-    let final_zip_writer = Arc::try_unwrap(zip_writer)
-        .expect("Arc unwrap failed")
+    let stream = stream::iter(download_futs).buffer_unordered(max_workers);
+    let results: Vec<_> = stream.collect().await;
+
+    // Check for any hard errors from the download futures
+    for result in results {
+        if let Err(e) = result {
+            // A failure in one download should fail the whole process if it's a critical error
+            // The current logic inside the future just increments a counter.
+            // To ensure we stop, we can check the failed_downloads count after.
+            error!("A download task failed: {}", e);
+        }
+    }
+
+    let final_writer = Arc::try_unwrap(writer)
+        .expect("Writer lock should not be held")
         .into_inner()
         .unwrap();
-    final_zip_writer.finish()?;
 
-    let final_size = *total_downloaded_size.lock().unwrap();
-    Ok(final_size)
+    tokio::task::spawn_blocking(move || {
+        final_writer.finish()?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await??;
+
+    let total_size = *total_size.lock().unwrap();
+    let successful_downloads = *successful_downloads.lock().unwrap();
+    let failed_downloads = *failed_downloads.lock().unwrap();
+
+    Ok((total_size, successful_downloads, failed_downloads))
+}
+
+// Helper function to delete files in batches
+async fn delete_files_in_batches(
+    client: &Client,
+    files_to_process: &[(String, String)],
+) -> Result<(usize, usize), Error> {
+    let mut success_count = 0;
+    let mut failed_count = 0;
+
+    let mut files_by_bucket: HashMap<String, Vec<aws_sdk_s3::types::ObjectIdentifier>> =
+        HashMap::new();
+    for (bucket, key) in files_to_process {
+        let identifier = aws_sdk_s3::types::ObjectIdentifier::builder()
+            .key(key)
+            .build()
+            .map_err(|e| Error::from(format!("Failed to build object identifier: {e}")))?;
+        files_by_bucket
+            .entry(bucket.clone())
+            .or_default()
+            .push(identifier);
+    }
+
+    for (bucket, objects) in files_by_bucket {
+        for chunk in objects.chunks(1000) {
+            let delete_request = aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(chunk.to_vec()))
+                .quiet(true)
+                .build()
+                .map_err(|e| Error::from(format!("Failed to build delete request: {e}")))?;
+
+            match client
+                .delete_objects()
+                .bucket(&bucket)
+                .delete(delete_request)
+                .send()
+                .await
+            {
+                Ok(output) => {
+                    let deleted_count = chunk.len();
+                    if let Some(errors) = output.errors {
+                        let failed_to_delete = errors.len();
+                        failed_count += failed_to_delete;
+                        success_count += deleted_count.saturating_sub(failed_to_delete);
+                        for error in errors {
+                            error!(
+                                "Failed to delete object {} from bucket {}: {}",
+                                error.key.unwrap_or_default(),
+                                bucket,
+                                error.message.unwrap_or_default()
+                            );
+                        }
+                    } else {
+                        success_count += deleted_count;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to delete objects from bucket {}: {}", bucket, e);
+                    failed_count += chunk.len();
+                }
+            }
+        }
+    }
+
+    Ok((success_count, failed_count))
 }
