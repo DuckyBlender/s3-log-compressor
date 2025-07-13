@@ -247,3 +247,6 @@ $RECYCLE.BIN/
 dev/mock_logs
 .DS_Store
 lambda.zip
+example_inventory.csv
+dev/*.png
+dev/cost_analysis.py

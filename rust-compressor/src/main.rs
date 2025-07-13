@@ -85,6 +85,21 @@ async fn handle_decompress_operation(client: &Client, event: &Value) -> Result<V
         file_to_extract, source_s3_url
     );
 
+    // Check storage class to prevent trying to access from deep archive
+    let head_object_output = client
+        .head_object()
+        .bucket(&bucket)
+        .key(&key)
+        .send()
+        .await?;
+    if let Some(storage_class) = head_object_output.storage_class {
+        if storage_class.as_str() == "DEEP_ARCHIVE" {
+            return Err(Error::from(
+                "Object is in Deep Archive. Restore it before decompressing.",
+            ));
+        }
+    }
+
     let object = client.get_object().bucket(bucket).key(key).send().await?;
     let body_bytes = object.body.collect().await?.into_bytes();
     let reader = std::io::Cursor::new(body_bytes);
