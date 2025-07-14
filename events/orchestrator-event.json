@@ -1,0 +1,5 @@
+{
+  "inventory_s3_url": "s3://your-source-bucket/path/to/inventory.csv",
+  "output_manifest_s3_prefix": "s3://your-target-bucket/manifests/",
+  "date_to_process": "2024-12-25"
+}

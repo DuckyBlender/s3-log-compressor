@@ -12,6 +12,24 @@ A simple AWS Lambda function that downloads multiple files from S3 and creates a
 - **Concurrent Downloads**: Configurable worker threads for parallel processing.
 - **KMS Encryption**: Supports server-side encryption with KMS keys.
 
+## Orchestrator Lambda
+
+The orchestrator lambda is responsible for processing a large S3 inventory export. It filters the inventory for a specific day, groups the files by AWS account and region, generates a manifest for each group, and then invokes the `s3-log-compressor` lambda to compress the files for each group.
+
+### Orchestrator Event Structure
+
+```json
+{
+  "inventory_s3_url": "s3://your-source-bucket/path/to/inventory.csv",
+  "output_manifest_s3_prefix": "s3://your-target-bucket/manifests/",
+  "date_to_process": "2024-12-25"
+}
+```
+
+- `inventory_s3_url`: The S3 URL of the inventory export file (in CSV format).
+- `output_manifest_s3_prefix`: The S3 prefix where the generated manifest files will be stored.
+- `date_to_process`: The date (in `YYYY-MM-DD` format) to filter the inventory by.
+
 ## Event Structure
 
 The `operation` field determines the function's behavior.

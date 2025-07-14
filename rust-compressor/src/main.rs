@@ -25,7 +25,7 @@ async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .with_target(false)
-        .json()
+        .without_time()
         .init();
 
     let func = service_fn(handler);

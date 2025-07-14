@@ -102,3 +102,26 @@ Resources:
       #   - arn:aws:lambda:eu-central-1:534406734576:layer:zip-zstd-al2023-arm64:1
     Metadata:
       BuildMethod: rust-cargolambda
+
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: rust-orchestrator/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      MemorySize: 1024
+      Timeout: 900
+      Environment:
+        Variables:
+          COMPRESSOR_FUNCTION_ARN: !GetAtt CompressFunction.Arn
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref SourceBucket
+        - S3CrudPolicy:
+            BucketName: !Ref TargetBucket
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CompressFunction
+    Metadata:
+      BuildMethod: rust-cargolambda
