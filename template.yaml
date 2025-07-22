@@ -102,6 +102,7 @@ Resources:
       #   - arn:aws:lambda:eu-central-1:534406734576:layer:zip-zstd-al2023-arm64:1
     Metadata:
       BuildMethod: rust-cargolambda
+      BuildInSource: true
 
   OrchestratorFunction:
     Type: AWS::Serverless::Function
@@ -125,3 +126,4 @@ Resources:
             FunctionName: !Ref CompressFunction
     Metadata:
       BuildMethod: rust-cargolambda
+      BuildInSource: true
